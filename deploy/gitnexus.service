@@ -1,0 +1,29 @@
+[Unit]
+Description=GitNexus Serve
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+
+# Resolve the npm-link chain to the real script in the dev checkout.
+# Path comes from `readlink -f /usr/bin/gitnexus`.
+# `gitnexus serve` mounts MCP HTTP endpoints internally at /api/mcp,
+# so a separate `gitnexus mcp` daemon is not needed.
+ExecStart=/usr/bin/node %h/dev/GitNexus/gitnexus/dist/cli/index.js serve
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gitnexus
+
+Environment="NODE_ENV=production"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=-%h/.config/gitnexus/env
+
+[Install]
+WantedBy=default.target
