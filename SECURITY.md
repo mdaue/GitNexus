@@ -65,3 +65,20 @@ This repository runs the following scans automatically. Findings appear under th
 | Container image scan | [Trivy](https://github.com/aquasecurity/trivy-action) | Weekly, `main` push | Advisory (Security tab) |
 
 Dependency version updates are managed separately by Dependabot — see `.github/dependabot.yml`.
+
+## Audit Log
+
+Manual, point-in-time reviews conducted outside of the automated CI scans above. These are ad hoc audits, not a substitute for the continuous scans listed in the table above.
+
+### 2026-07-10 18:32 UTC — commit `ce66646e7eaa11f40199a38dda90832edd1777a1`
+
+**Scope:** Full-repository static sweep (not a diff) for reverse shells, backdoors/malicious logic, and data exfiltration — source, build scripts, CI workflows, editor/agent hook scripts (Claude/Cursor/Antigravity plugins), and package lifecycle scripts.
+
+**Result: No indicators found.**
+
+- **Reverse shells / RCE primitives:** Clean. All `exec`/`spawn` calls use fixed argv arrays against trusted local binaries (`git`, `npm`, `node-gyp`, `tsc`, `lsof`/`ps`/`which`, the `gitnexus` CLI); no `shell: true` with interpolated input, no `/bin/sh -i`, `/dev/tcp/`, `nc -e`, or PowerShell reverse-shell idioms. No dynamic execution of untrusted/decoded input.
+- **Data exfiltration:** Clean. No telemetry/analytics SDKs. Outbound network calls are limited to disclosed, user-initiated paths (`gitnexus publish` → `api.github.com` with only `owner/repo`, gated behind a user-supplied PAT; BYO-LLM/embedding endpoints using the user's own configured keys; standard CDN loads for `marked`/`mermaid`). No code path forwards env vars, SSH keys, or `.git/config` externally.
+- **Supply chain (install scripts, CI, hooks):** Clean. `postinstall`/`prepare` scripts only compile vendored native code locally. GitHub Actions third-party actions are pinned to commit SHAs; the one `pull_request_target` workflow gates on author association and checks out by SHA. Editor/agent hook scripts shell out to the local `gitnexus` CLI with fixed argv only, per their own in-code "never use `shell: true`" comment.
+- **Obfuscated/hidden payloads:** Clean. No suspicious base64 blobs, hex-decode-then-execute patterns, obfuscated identifiers, or committed minified source. No rogue binaries outside expected native-module/test-fixture locations.
+
+**Caveat:** Static sweep of GitNexus's own source and scripts; does not independently verify third-party dependency provenance/integrity (npm supply-chain compromise is a separate risk class from code authored in this repo).
