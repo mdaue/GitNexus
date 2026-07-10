@@ -70,16 +70,23 @@ import type { WorkerPool } from '../workers/worker-pool.js';
 import type {
   ExtractedDecoratorRoute,
   ExtractedFetchCall,
+  ExtractedModuleConstants,
   ExtractedORMQuery,
   ExtractedRoute,
   ExtractedToolDef,
   FetchWrapperDef,
 } from '../workers/parse-worker.js';
 import type {
+  ExtractedRouterConstructorPrefix,
   ExtractedRouterImport,
   ExtractedRouterInclude,
   ExtractedRouterModuleAlias,
 } from '../route-extractors/fastapi-router-bindings.js';
+import { normalizeExtractedRoutePath } from '../route-extractors/route-path.js';
+import {
+  resolveOperands,
+  type ModuleConstants,
+} from '../route-extractors/python-const-resolver.js';
 import {
   resolveInheritedSpringRoutes,
   type SharedSpringType,
@@ -623,7 +630,11 @@ export async function runChunkedParseAndResolve(
   const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
   const allRouterIncludes: ExtractedRouterInclude[] = [];
   const allRouterImports: ExtractedRouterImport[] = [];
+  const allRouterConstructorPrefixes: ExtractedRouterConstructorPrefix[] = [];
   const allRouterModuleAliases: ExtractedRouterModuleAlias[] = [];
+  // Per-file Python module constants (#2391); resolved into decorator route paths
+  // below, after cross-file aggregation, alongside the include_router prefix pass.
+  const allModuleConstants: ExtractedModuleConstants[] = [];
   const allSpringTypes: SharedSpringType[] = [];
   const allToolDefs: ExtractedToolDef[] = [];
   const allORMQueries: ExtractedORMQuery[] = [];
@@ -779,8 +790,16 @@ export async function runChunkedParseAndResolve(
         if (chunkWorkerData.routerImports?.length) {
           for (const item of chunkWorkerData.routerImports) allRouterImports.push(item);
         }
+        if (chunkWorkerData.routerConstructorPrefixes?.length) {
+          for (const item of chunkWorkerData.routerConstructorPrefixes) {
+            allRouterConstructorPrefixes.push(item);
+          }
+        }
         if (chunkWorkerData.routerModuleAliases?.length) {
           for (const item of chunkWorkerData.routerModuleAliases) allRouterModuleAliases.push(item);
+        }
+        if (chunkWorkerData.moduleConstants?.length) {
+          for (const item of chunkWorkerData.moduleConstants) allModuleConstants.push(item);
         }
         if (chunkWorkerData.springTypes?.length) {
           for (const item of chunkWorkerData.springTypes) allSpringTypes.push(item);
@@ -1142,6 +1161,40 @@ export async function runChunkedParseAndResolve(
 
   // FastAPI router-prefix resolution (cross-file).
   //
+  // #2391: resolve non-literal FastAPI decorator route paths (imported/composed
+  // string constants) BEFORE the include_router/APIRouter prefix pass below, so a
+  // resolved path is then prefix-joined like any literal path. Each such route
+  // carries `routePathExpr`/`routePathOperands` and an empty `routePath`; we fold
+  // the operands against the repo-wide, file-path-keyed constant map. On failure
+  // we DROP the route (KTD5 skip floor) rather than emit a phantom `POST /`.
+  if (allDecoratorRoutes.some((dr) => dr.routePathExpr !== undefined)) {
+    const repoConstants = new Map<string, ModuleConstants>();
+    for (const { filePath, constants } of allModuleConstants) {
+      repoConstants.set(filePath, constants);
+    }
+    const resolvedRoutes: ExtractedDecoratorRoute[] = [];
+    let skipped = 0;
+    for (const dr of allDecoratorRoutes) {
+      if (dr.routePathExpr === undefined) {
+        resolvedRoutes.push(dr);
+        continue;
+      }
+      const value = dr.routePathOperands
+        ? resolveOperands(dr.filePath, dr.routePathOperands, repoConstants)
+        : null;
+      if (value === null) {
+        skipped++;
+        continue;
+      }
+      resolvedRoutes.push({ ...dr, routePath: value });
+    }
+    allDecoratorRoutes.length = 0;
+    for (const dr of resolvedRoutes) allDecoratorRoutes.push(dr);
+    if (isDev && skipped > 0) {
+      logger.info(`  🧩 Resolved composed route constants; ${skipped} unresolved route(s) skipped`);
+    }
+  }
+
   // Workers emit two kinds of records per Python file:
   //   • `routerIncludes` — every `app.include_router(<routerExpr>, prefix='/x')`
   //     site, where `routerExpr` is either `<module>.router` (Shape A) or a
@@ -1156,7 +1209,10 @@ export async function runChunkedParseAndResolve(
   // decorator inherits its file-basename's prefix. When a router is mounted
   // under multiple prefixes we duplicate the route entry, mirroring FastAPI's
   // runtime behaviour.
-  if (allRouterIncludes.length > 0 && allDecoratorRoutes.length > 0) {
+  if (
+    (allRouterIncludes.length > 0 || allRouterConstructorPrefixes.length > 0) &&
+    allDecoratorRoutes.length > 0
+  ) {
     // Group `routerImports` by file so we can resolve Shape-B locals against
     // imports declared in the SAME file as the include_router call. We carry
     // both the short module key (file basename) and, when available, the long
@@ -1201,6 +1257,11 @@ export async function runChunkedParseAndResolve(
     // without a corresponding import statement).
     const prefixesByLongKey = new Map<string, Set<string>>();
     const prefixesByShortKey = new Map<string, Set<string>>();
+    // Constructor prefixes are `router`-only (the apply gate below and the
+    // group-layer tree-sitter both pin to the literal name `router`), so a
+    // flat file-key → prefix map suffices — mirrors the group layer's shape.
+    const constructorPrefixesByLongKey = new Map<string, string>();
+    const constructorPrefixesByShortKey = new Map<string, string>();
 
     const recordPrefix = (target: Map<string, Set<string>>, key: string, prefix: string): void => {
       let set = target.get(key);
@@ -1241,7 +1302,11 @@ export async function runChunkedParseAndResolve(
       }
     }
 
-    if (prefixesByLongKey.size > 0 || prefixesByShortKey.size > 0) {
+    if (
+      prefixesByLongKey.size > 0 ||
+      prefixesByShortKey.size > 0 ||
+      allRouterConstructorPrefixes.length > 0
+    ) {
       const fileLongKey = (rel: string): string => {
         // Strip `.py`, then take the last two path segments. `api/users.py`
         // → `api/users`. Files at the repo root return the empty string,
@@ -1263,6 +1328,15 @@ export async function runChunkedParseAndResolve(
         return file.endsWith('.py') ? file.slice(0, -3) : file;
       };
 
+      for (const ctor of allRouterConstructorPrefixes) {
+        const longKey = fileLongKey(ctor.filePath);
+        if (longKey) {
+          constructorPrefixesByLongKey.set(longKey, ctor.prefix);
+        } else {
+          constructorPrefixesByShortKey.set(fileShortKey(ctor.filePath), ctor.prefix);
+        }
+      }
+
       const expanded: ExtractedDecoratorRoute[] = [];
       for (const dr of allDecoratorRoutes) {
         if (dr.decoratorReceiver !== 'router' || !dr.filePath.endsWith('.py')) {
@@ -1278,12 +1352,24 @@ export async function runChunkedParseAndResolve(
           ? undefined
           : prefixesByShortKey.get(fileShortKey(dr.filePath));
         const prefixes = longPrefixes ?? shortPrefixes;
+        // Constructor prefixes are keyed like include_router prefixes:
+        // long-key entries are precise, while short-key entries are only
+        // valid for repo-root/single-segment files where `fileLongKey`
+        // returns ''. Do not fall back from a missing long-key match to the
+        // short key or a root `users.py` prefix can leak onto
+        // `admin/users.py`.
+        const constructorPrefix = longKey
+          ? constructorPrefixesByLongKey.get(longKey)
+          : constructorPrefixesByShortKey.get(fileShortKey(dr.filePath));
+        const routePath = constructorPrefix
+          ? normalizeExtractedRoutePath(dr.routePath, constructorPrefix)
+          : dr.routePath;
         if (!prefixes || prefixes.size === 0) {
-          expanded.push(dr);
+          expanded.push(routePath === dr.routePath ? dr : { ...dr, routePath });
           continue;
         }
         for (const prefix of prefixes) {
-          expanded.push({ ...dr, prefix });
+          expanded.push({ ...dr, routePath, prefix });
         }
       }
       allDecoratorRoutes.length = 0;
