@@ -4,7 +4,8 @@ CLAUDE_CONFIG := $(HOME)/.claude/config.json
 
 install:
 	sudo find $(CURDIR) -user root -exec chown $$(id -un):$$(id -gn) {} +
-	cd gitnexus && npm install && npm run build && sudo npm link
+	cd gitnexus_shared && npm install && cd ..
+	cd gitnexus && npm install tsc && npm install && npm run build && sudo npm link
 	mkdir -p $(HOME)/.claude
 	test -f $(CLAUDE_CONFIG) || echo '{}' > $(CLAUDE_CONFIG)
 	jq --argjson gitnexus '{"command":"/usr/bin/node","args":["$(CURDIR)/gitnexus/dist/cli/index.js","mcp"],"cwd":"/var/lib/gitnexus","env":{"NODE_ENV":"production"},"timeout":30000,"trust":false}' \
