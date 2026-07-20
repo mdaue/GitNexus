@@ -4,7 +4,7 @@ CLAUDE_CONFIG := $(HOME)/.claude/config.json
 
 install:
 	sudo find $(CURDIR) -user root -exec chown $$(id -un):$$(id -gn) {} +
-	cd gitnexus_shared && npm install && cd ..
+	cd gitnexus-shared && npm install && cd ..
 	cd gitnexus && npm install tsc && npm install && npm run build && sudo --preserve-env=PATH npm link
 	mkdir -p $(HOME)/.claude
 	test -f $(CLAUDE_CONFIG) || echo '{}' > $(CLAUDE_CONFIG)
