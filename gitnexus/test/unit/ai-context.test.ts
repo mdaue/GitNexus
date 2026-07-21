@@ -235,10 +235,8 @@ describe('generateAIContextFiles', () => {
     // legitimate future additions but will fail loudly if the trim is
     // reverted or someone pads the block back out toward the original size.
     //
-    // Raised 2700 → 2900 for #243: the regression-compare example (one
-    // load-bearing per-repo `base_ref` line on the detect_changes bullet) is a
-    // legitimate addition, not a revert of the trim — the block stays roughly
-    // half the original size.
+    // Raised 2900 → 3600: added pdg-query, taint-analysis, and pr-review skill rows,
+    // trace tool directive, and graph schema/group resources.
     const stats = { nodes: 50, edges: 100, processes: 5 };
     await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
 
@@ -247,7 +245,7 @@ describe('generateAIContextFiles', () => {
       content.indexOf('<!-- gitnexus:start -->'),
       content.indexOf('<!-- gitnexus:end -->'),
     );
-    expect(block.length).toBeLessThan(2900);
+    expect(block.length).toBeLessThan(3800);
   });
 
   it('handles empty stats', async () => {

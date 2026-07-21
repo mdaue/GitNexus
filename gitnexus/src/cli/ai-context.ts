@@ -171,6 +171,9 @@ export function generateGitNexusContent(
 | Blast radius / "What breaks if I change X?" | \`.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md\` |
 | Trace bugs / "Why is X failing?" | \`.claude/skills/gitnexus/gitnexus-debugging/SKILL.md\` |
 | Rename / extract / split / refactor | \`.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md\` |
+| Control & Data dependence / CDG & def-use | \`.claude/skills/gitnexus/gitnexus-pdg-query/SKILL.md\` |
+| Security taint flow analysis | \`.claude/skills/gitnexus/gitnexus-taint-analysis/SKILL.md\` |
+| Code review & PR verification | \`.claude/skills/gitnexus/gitnexus-pr-review/SKILL.md\` |
 | Tools, resources, schema reference | \`.claude/skills/gitnexus/gitnexus-guide/SKILL.md\` |
 | Index, status, clean, wiki CLI commands | \`.claude/skills/gitnexus/gitnexus-cli/SKILL.md\` |`;
 
@@ -193,22 +196,23 @@ ${tableBody}`
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows)`}. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows)`}. Use GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
-> Index stale? Run \`${runner} analyze\` from the project root — it auto-selects an available runner. ${bootstrapNote}
+> Index stale? Run \`${runner} analyze\` from project root (add \`--embeddings\` for semantic search, \`--pdg\` for taint/flow analysis). ${bootstrapNote}
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run \`impact({target: "symbolName", direction: "upstream"})\` and report the blast radius (direct callers, affected processes, risk level) to the user.${
+- **MUST run impact analysis before editing any symbol.** Run \`impact({target: "symbolName", direction: "upstream"})\` and report blast radius (callers, affected processes, risk) to the user.${
     hasPdg
       ? ` For unified PDG impact, add \`mode: "pdg"\` with optional \`line: <N>\` — it returns statement-level \`affectedStatements\` over CDG + REACHING_DEF and inter-procedural symbols in \`interproceduralByDepth\`/\`byDepth\`; no-layer/degraded PDG results are UNKNOWN-risk notes (\`--pdg\` layer).`
       : ''
   }
-- **MUST run \`detect_changes()\` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: \`detect_changes({scope: "compare", base_ref: ${JSON.stringify(markdownSafeBranch(defaultBranch))}})\`.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use \`query({search_query: "concept"})\` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- **MUST run \`detect_changes()\` before committing** to verify changed scope. Compare against default branch: \`detect_changes({scope: "compare", base_ref: ${JSON.stringify(markdownSafeBranch(defaultBranch))}})\`.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before editing.
+- **MUST use \`query({search_query: "concept"})\` for codebase search** (hybrid BM25 + vector search RRF) instead of grepping or filesystem search tools.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use \`context({name: "symbolName"})\`.
-- For security review, \`explain({target: "fileOrSymbol"})\` lists taint findings (source→sink flows; needs \`analyze --pdg\`).${
+- When tracing how symbol A reaches symbol B, use \`trace({from: "A", to: "B"})\` instead of manual multi-hop chaining.
+- For security review, \`explain({target: "fileOrSymbol"})\` lists taint findings (source→sink flows; needs \`analyze --pdg\})\`.${
     hasPdg
       ? `\n- For control/data dependence, \`pdg_query({mode: "controls", target: "fileOrSymbol"})\` answers "under what condition does X run?" (CDG, incl. guard clauses) and \`pdg_query({mode: "flows", target, variable})\` traces "where does variable Y flow?" (REACHING_DEF). \`--pdg\` layer.`
       : ''
@@ -220,6 +224,7 @@ This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${s
 - NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
 - NEVER rename symbols with find-and-replace — use \`rename\` which understands the call graph.
 - NEVER commit changes without running \`detect_changes()\` to check affected scope.
+- NEVER use filesystem search tools (\`grep\`, \`ripgrep\`, \`find\`) to search the repository — use \`query({search_query: "concept"})\` for semantic search across execution flows and code definitions.
 
 ## Resources
 
@@ -229,6 +234,9 @@ This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${s
 | \`gitnexus://repo/${projectName}/clusters\` | All functional areas |
 | \`gitnexus://repo/${projectName}/processes\` | All execution flows |
 | \`gitnexus://repo/${projectName}/process/{name}\` | Step-by-step execution trace |
+| \`gitnexus://repo/${projectName}/schema\` | Graph schema for Cypher queries |
+| \`gitnexus://group/{name}/contracts\` | Cross-repo inter-service contract boundaries |
+| \`gitnexus://group/{name}/status\` | Cross-repo group indexing health |
 
 ${
   groupNames && groupNames.length > 0

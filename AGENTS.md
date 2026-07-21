@@ -59,6 +59,7 @@ commits, or posts.
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-07-20 | 1.9.0 | Added semantic search requirements, PDG/taint analysis tools, trace tool, group mode rules, and updated skill/resource tables. |
 | 2026-05-22 | 1.8.0 | Kotlin added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). Closes #1756 (companion-vs-instance dispatch) and #1757 (lambda scopes); refs #1746. RFC §6.4 corpus criterion waived (corpus-mode wiring is #927-scope); fixture criterion met. |
 | 2026-04-23 | 1.7.0 | TypeScript added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). |
 | 2026-04-20 | 1.6.0 | Added scope-resolution pipeline pointer (RFC #909 Ring 3); Python migrated to registry-primary. |
@@ -76,15 +77,16 @@ commits, or posts.
 
 This project is indexed by GitNexus as **GitNexus** (26675 symbols, 35395 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
-> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+> Index stale? Run `node .gitnexus/run.cjs analyze --embeddings --pdg` from the project root — it auto-selects an available runner. Add `--embeddings` for semantic search and `--pdg` for taint/control-flow analysis. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
 ## Always Do
 
 - **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
 - **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- **MUST use GitNexus `query({search_query: "..."})` for codebase search.** Use hybrid BM25 + semantic vector search (RRF) via `query` instead of filesystem search tools (`grep`, `ripgrep`, `find`).
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+- When tracing how symbol A reaches symbol B, use `trace({from: "A", to: "B"})` instead of manual multi-hop chaining.
 
 ## Never Do
 
@@ -92,6 +94,23 @@ This project is indexed by GitNexus as **GitNexus** (26675 symbols, 35395 relati
 - NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
 - NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
 - NEVER commit changes without running `detect_changes()` to check affected scope.
+- NEVER use filesystem search tools (`grep`, `ripgrep`, `find`, `grep_search`) to search the repository — use `query({search_query: "..."})` for semantic search across execution flows and code definitions.
+
+## MCP Tools Quick Reference
+
+| Tool | Purpose | Requirements / Notes |
+|------|---------|----------------------|
+| `query` | Process-grouped code search | Uses hybrid BM25 + vector search (RRF). Supports `repo: "@<groupName>"` |
+| `context` | 360-degree symbol details | Symbol callers, callees, and execution flow memberships |
+| `impact` | Blast radius analysis | Upstream/downstream call chain traversal |
+| `trace` | Shortest path between symbols | Directed path over `CALLS` (from A to B) |
+| `pdg_query` | Control & Data dependence | Mode `controls` (CDG) or `flows` (data def-use). Requires `analyze --pdg` |
+| `explain` | Taint analysis security findings | Returns source-to-sink paths for vulnerabilities. Requires `analyze --pdg` |
+| `detect_changes` | Git diff impact check | Validates scope of uncommitted changes |
+| `rename` | Call-graph aware renaming | Safe coordinated refactoring across files |
+| `cypher` | Direct graph queries | Read `gitnexus://repo/{name}/schema` first |
+| `check` | Graph invariant validation | Finds circular imports and broken references |
+| `list_repos` | Paginated repository list | Supports `limit` and `offset` pagination |
 
 ## Resources
 
@@ -101,8 +120,11 @@ This project is indexed by GitNexus as **GitNexus** (26675 symbols, 35395 relati
 | `gitnexus://repo/GitNexus/clusters` | All functional areas |
 | `gitnexus://repo/GitNexus/processes` | All execution flows |
 | `gitnexus://repo/GitNexus/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/GitNexus/schema` | Graph schema for Cypher queries |
+| `gitnexus://group/{name}/contracts` | Cross-repo inter-service contract boundaries |
+| `gitnexus://group/{name}/status` | Cross-repo group indexing health |
 
-## CLI
+## CLI & Skills
 
 | Task | Read this skill file |
 |------|---------------------|
@@ -110,6 +132,9 @@ This project is indexed by GitNexus as **GitNexus** (26675 symbols, 35395 relati
 | Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
 | Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
 | Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Control & Data dependence / CDG & def-use | `.claude/skills/gitnexus/gitnexus-pdg-query/SKILL.md` |
+| Security taint flow analysis | `.claude/skills/gitnexus/gitnexus-taint-analysis/SKILL.md` |
+| Code review & PR verification | `.claude/skills/gitnexus/gitnexus-pr-review/SKILL.md` |
 | Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 | Work in the Ingestion area (239 symbols) | `.claude/skills/generated/ingestion/SKILL.md` |
