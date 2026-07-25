@@ -73,8 +73,8 @@ describe('CALL_SUMMARY relation-type exclusion (U-C1)', () => {
 });
 
 describe('CALL_SUMMARY incremental reuse gate (U-C5)', () => {
-  it('INCREMENTAL_SCHEMA_VERSION is bumped to 6 (uniform 0-based line storage re-index window)', () => {
-    expect(INCREMENTAL_SCHEMA_VERSION).toBe(6);
+  it('INCREMENTAL_SCHEMA_VERSION is bumped to 14 (C#/Kotlin instance-ownership free-call gate, #2563)', () => {
+    expect(INCREMENTAL_SCHEMA_VERSION).toBe(14);
   });
 
   it('a pre-current stamp fails the `=== INCREMENTAL_SCHEMA_VERSION` reuse gate → forces full re-analyze', () => {
@@ -95,7 +95,40 @@ describe('CALL_SUMMARY incremental reuse gate (U-C5)', () => {
     // COBOL/JCL/markdown/scope rows are still 1-based, so an incremental top-up
     // would mix bases → must NOT reuse.
     expect(passesReuseGate(5)).toBe(false);
+    // A pre-v7 (v6) index predates the callable-value-flow edges (#2437/#2522)
+    // — new edges between unchanged files would never enter the incremental
+    // write set → must NOT reuse.
+    expect(passesReuseGate(6)).toBe(false);
+    // A pre-v8 (v7) index predates the Java anonymous-class instance model
+    // (#2550) — `Worker.run`-keyed Method nodes would be stranded alongside
+    // the re-keyed `Worker$N.run` ones on unchanged files → must NOT reuse.
+    expect(passesReuseGate(7)).toBe(false);
+    // A pre-v9 (v8) index predates enum constant bodies + JLS 13.1
+    // immediate-host naming (#2555) — `E.hook`-keyed Method nodes and
+    // topmost-anchored `EnumWrap$1`-style ids would be stranded alongside
+    // the re-keyed ones on unchanged files → must NOT reuse.
+    expect(passesReuseGate(8)).toBe(false);
+    // A pre-v10 (v9) index predates the Java record container-node fix
+    // (#2564) — a record's methods would keep being ownerless Method nodes
+    // with no HAS_METHOD edge on unchanged files → must NOT reuse.
+    expect(passesReuseGate(9)).toBe(false);
+    // A pre-v11 (v10) index predates the Rust dyn-trait-object dispatch fix
+    // (#2604) — abstract trait methods would keep being uncaptured (no
+    // ownerId/CALLS resolution) on unchanged Rust trait files → must NOT reuse.
+    expect(passesReuseGate(10)).toBe(false);
+    // A pre-v12 (v11) index predates the #2514 Rust range-binding fix — the
+    // ambiguity latch removes spurious cross-file CALLS edges and the
+    // import-disambiguated resolution adds new ones on unchanged Rust files,
+    // neither of which reach an incremental write set → must NOT reuse.
+    expect(passesReuseGate(11)).toBe(false);
+    // A pre-v13 (v12) index predates javac-compatible Java local-type
+    // identities and lexical visibility scopes (#2562), so unchanged
+    // simple-name-keyed type/member ids must not survive.
+    expect(passesReuseGate(12)).toBe(false);
+    // A pre-v14 (v13) index predates the C#/Kotlin instance-ownership gate,
+    // so unchanged files may retain spurious same-file CALLS edges.
+    expect(passesReuseGate(13)).toBe(false);
     // A current-version stamp passes the gate (incremental top-up eligible).
-    expect(passesReuseGate(6)).toBe(true);
+    expect(passesReuseGate(14)).toBe(true);
   });
 });

@@ -20,10 +20,15 @@ import {
   NodeTableName,
 } from './schema.js';
 import { streamAllCSVsToDisk, type StreamedCSVResult } from './csv-generator.js';
+import type { GraphEmitManifest } from './graph-emit-sink.js';
 import type { PdgEmitManifest } from './pdg-emit-sink.js';
 import { getNodeLabel as deriveNodeLabel, type WriteStreamFactory } from './rel-pair-routing.js';
 import { EMBEDDABLE_LABELS, type CachedEmbedding } from '../embeddings/types.js';
-import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
+import {
+  extensionManager,
+  resolveAnalyzeInstallPolicy,
+  type ExtensionEnsureOptions,
+} from './extension-loader.js';
 import {
   classifyDeleteAllError,
   closeLbugConnection,
@@ -32,6 +37,7 @@ import {
   isDbBusyError,
   isOpenRetryExhausted,
   isWalCorruptionError,
+  bufferPoolExhaustionRemedy,
   openLbugConnection,
   sleep,
   toNativeSafePath,
@@ -41,6 +47,7 @@ import {
   type LbugConnectionHandle,
 } from './lbug-config.js';
 import {
+  cleanQuarantinedMissingShadowWals,
   finalizeLbugSidecarsAfterClose,
   guardWalQuarantine,
   isMissingShadowSidecarError,
@@ -50,8 +57,8 @@ import {
   quarantineWalForMissingShadow,
   renameFailureMessage,
   shadowSidecarRecoveryMessage,
+  sidecarPreflightDisabled,
 } from './sidecar-recovery.js';
-import { isVectorExtensionSupportedByPlatform } from '../platform/capabilities.js';
 
 import { logger } from '../logger.js';
 // ---------------------------------------------------------------------------
@@ -793,7 +800,8 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
         const realPath = await fs.realpath(dbPath);
         const parentDir = path.dirname(dbPath);
         const realParent = await fs.realpath(parentDir);
-        if (!realPath.startsWith(realParent + path.sep) && realPath !== realParent) {
+        const safePrefix = realParent.endsWith(path.sep) ? realParent : realParent + path.sep;
+        if (!realPath.startsWith(safePrefix) && realPath !== realParent) {
           throw new Error(
             `Refusing to delete ${dbPath}: resolved path ${realPath} is outside storage directory`,
           );
@@ -817,6 +825,30 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
     // -------------------------------------------------------------------------
     const releaseInitLock = await acquireInitLock(dbPath);
     try {
+      // Reclaim missing-shadow WAL quarantines from a PRIOR crash (#2637).
+      // LadybugDB renames an unrecoverable WAL aside as
+      // `${dbPath}.wal.missing-shadow.<ts>-<rand>` (quarantineWalForMissingShadow)
+      // instead of deleting it. Once quarantined it is permanently detached from
+      // the live store and never reopened, so reclaiming it is safe regardless of
+      // whether the main DB file exists this run — unlike the orphan-sidecar
+      // cleanup below, this must NOT be gated on "main DB missing": a quarantine
+      // event and a healthy main DB are independent facts. Never let a reclaim
+      // failure (e.g. a transient EBUSY from an antivirus scan) block DB startup.
+      if (!sidecarPreflightDisabled()) {
+        try {
+          const reclaimed = await cleanQuarantinedMissingShadowWals(dbPath);
+          for (const file of reclaimed) {
+            logger.warn(
+              `GitNexus: reclaimed quarantined WAL ${path.basename(file)} from a prior crash`,
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            `GitNexus: failed to reclaim missing-shadow WAL quarantines: ${summarizeError(err)}`,
+          );
+        }
+      }
+
       // Crash-recovery cleanup: if the main DB file is missing, stale sidecars
       // from an interrupted run can block fresh opens indefinitely.
       try {
@@ -948,7 +980,14 @@ const copyNodeCSVs = async (
     const copyQuery = getCopyQuery(table, normalizeCopyPath(csvPath));
     await copyCsvWithRetry(targetConn, copyQuery, (retryErr) => {
       const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-      throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
+      // Pool exhaustion gets a remedy (#2631): the raw binder text gives the
+      // operator nothing to act on, and on non-4K-page hosts (Ascend aarch64,
+      // Apple Silicon) the pool bills up to pageSize/4KiB x faster than the
+      // sizing was calibrated for — name the knob and the mechanism.
+      const remedy = bufferPoolExhaustionRemedy(retryMsg);
+      throw new Error(
+        `COPY failed for ${table}: ${retryMsg.slice(0, 200)}${remedy ? ` ${remedy}` : ''}`,
+      );
     });
   }
 };
@@ -979,6 +1018,15 @@ export const loadGraphToLbug = async (
    * emits none — the manifest is the sole source and there is no double-COPY.
    */
   pdgEmitManifest?: PdgEmitManifest,
+  /**
+   * Streamed structural-emit manifest (#2680). Unlike {@link pdgEmitManifest},
+   * these pair keys are NOT disjoint from the whole-graph emit's: a streamed
+   * `CALLS` edge is `Function|Function`, exactly like the retained edges
+   * `streamAllCSVsToDisk` just wrote. So these files are APPENDED as additional
+   * COPY jobs for the same pair rather than merged into `relsByPair` (a Map,
+   * which holds one CSV per pair and would silently drop one of them).
+   */
+  graphEmitManifest?: GraphEmitManifest,
 ) => {
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
@@ -1118,16 +1166,32 @@ export const loadGraphToLbug = async (
   let tCopyRels = tCopyNodes;
   let tFallback = tCopyNodes;
 
-  const insertedRels = totalValidRels;
+  // One COPY job per CSV FILE, not per label pair. The whole-graph emit writes
+  // at most one file per pair, but the streamed structural manifest (#2680) can
+  // contribute a second file for a pair the whole-graph emit also wrote — both
+  // must load. `relsByPair` stays a one-file-per-pair Map so the PDG merge above
+  // and every other consumer are untouched.
+  const copyJobs: Array<{ pairKey: string; csvPath: string; rows: number }> = [];
+  for (const [pairKey, meta] of relsByPair) {
+    copyJobs.push({ pairKey, csvPath: meta.csvPath, rows: meta.rows });
+  }
+  if (graphEmitManifest) {
+    for (const [pairKey, meta] of graphEmitManifest.relsByPair) {
+      copyJobs.push({ pairKey, csvPath: meta.csvPath, rows: meta.rows });
+    }
+  }
+
+  const insertedRels = totalValidRels + (graphEmitManifest?.totalRows ?? 0);
   const warnings: string[] = [];
+  let poolRemedyIssued = false;
   if (insertedRels > 0) {
-    log(`Loading edges: ${insertedRels.toLocaleString()} across ${relsByPair.size} types`);
+    log(`Loading edges: ${insertedRels.toLocaleString()} across ${copyJobs.length} CSV files`);
 
     let pairIdx = 0;
     let failedPairEdges = 0;
     const failedPairCsvPaths = new Set<string>();
 
-    for (const [pairKey, { csvPath: pairCsvPath, rows }] of relsByPair) {
+    for (const { pairKey, csvPath: pairCsvPath, rows } of copyJobs) {
       pairIdx++;
       const [fromLabel, toLabel] = pairKey.split('|');
       const normalizedPath = normalizeCopyPath(pairCsvPath);
@@ -1135,7 +1199,7 @@ export const loadGraphToLbug = async (
       const copyQuery = `COPY ${REL_TABLE_NAME} FROM "${normalizedPath}" (from="${fromLabel}", to="${toLabel}", HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
 
       if (pairIdx % 5 === 0 || rows > 1000) {
-        log(`Loading edges: ${pairIdx}/${relsByPair.size} types (${fromLabel} -> ${toLabel})`);
+        log(`Loading edges: ${pairIdx}/${copyJobs.length} files (${fromLabel} -> ${toLabel})`);
       }
 
       // Use the captured `writeConn` (not the module-level `conn`) for the rel
@@ -1146,6 +1210,17 @@ export const loadGraphToLbug = async (
       await copyCsvWithRetry(writeConn, copyQuery, (retryErr) => {
         const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
         warnings.push(`${fromLabel}->${toLabel} (${rows} edges): ${retryMsg.slice(0, 80)}`);
+        // One remedy per bulk load, not per pair (#2631): pool exhaustion
+        // repeats for every remaining pair once it starts. logger.warn, not
+        // just warnings.push — the returned warnings array has no consumer at
+        // any call site, so a push alone would leave the remedy invisible
+        // while the row-by-row fallback quietly degrades the load.
+        const remedy = poolRemedyIssued ? undefined : bufferPoolExhaustionRemedy(retryMsg);
+        if (remedy) {
+          poolRemedyIssued = true;
+          warnings.push(remedy);
+          logger.warn(remedy);
+        }
         failedPairEdges += rows;
         failedPairCsvPaths.add(pairCsvPath);
       });
@@ -1286,6 +1361,13 @@ const formatCypherValue = (v: unknown): string => {
   return `'${escapeCypherString(String(v))}'`;
 };
 
+const formatCypherStringArray = (value: unknown): string => {
+  const items = Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+  return `[${items.map(formatCypherValue).join(', ')}]`;
+};
+
 /**
  * Fallback: insert relationships one-by-one if COPY fails.
  *
@@ -1375,6 +1457,9 @@ export const getCopyQuery = (table: NodeTableName, filePath: string): string => 
     // `calleeIds` is its SOUND parallel (space-joined resolved callee ids, #2227).
     return `COPY ${t}(id, filePath, startLine, endLine, text, callees, calleeIds) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
+  if (table === 'Class') {
+    return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, frameworkAnnotations) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
   if (table === 'Method') {
     return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
@@ -1428,6 +1513,11 @@ export const insertNodeToLbug = async (
       // Taint/PDG substrate (issue #2080) — no name column. `calleeIds` (#2227)
       // is the sound resolved-id parallel to the leaf-name `callees` set.
       query = `CREATE (n:BasicBlock {id: ${formatCypherValue(properties.id)}, filePath: ${formatCypherValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, text: ${formatCypherValue(properties.text || '')}, callees: ${formatCypherValue(properties.callees || '')}, calleeIds: ${formatCypherValue(properties.calleeIds || '')}})`;
+    } else if (label === 'Class') {
+      const descPart = properties.description
+        ? `, description: ${formatCypherValue(properties.description)}`
+        : '';
+      query = `CREATE (n:Class {id: ${formatCypherValue(properties.id)}, name: ${formatCypherValue(properties.name)}, filePath: ${formatCypherValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, isExported: ${!!properties.isExported}, content: ${formatCypherValue(properties.content || '')}${descPart}, frameworkAnnotations: ${formatCypherStringArray(properties.frameworkAnnotations)}})`;
     } else if (TABLES_WITH_EXPORTED.has(label)) {
       const descPart = properties.description
         ? `, description: ${formatCypherValue(properties.description)}`
@@ -1513,6 +1603,11 @@ export const batchInsertNodesToLbug = async (
           // Taint/PDG substrate (issue #2080) — no name column. `calleeIds`
           // (#2227) is the sound resolved-id parallel to the `callees` set.
           query = `MERGE (n:BasicBlock {id: ${formatCypherValue(properties.id)}}) SET n.filePath = ${formatCypherValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.text = ${formatCypherValue(properties.text || '')}, n.callees = ${formatCypherValue(properties.callees || '')}, n.calleeIds = ${formatCypherValue(properties.calleeIds || '')}`;
+        } else if (label === 'Class') {
+          const descPart = properties.description
+            ? `, n.description = ${formatCypherValue(properties.description)}`
+            : '';
+          query = `MERGE (n:Class {id: ${formatCypherValue(properties.id)}}) SET n.name = ${formatCypherValue(properties.name)}, n.filePath = ${formatCypherValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.isExported = ${!!properties.isExported}, n.content = ${formatCypherValue(properties.content || '')}${descPart}, n.frameworkAnnotations = ${formatCypherStringArray(properties.frameworkAnnotations)}`;
         } else if (TABLES_WITH_EXPORTED.has(label)) {
           const descPart = properties.description
             ? `, n.description = ${formatCypherValue(properties.description)}`
@@ -2124,16 +2219,18 @@ export const isLbugReady = (): boolean => conn !== null && db !== null;
 
 /**
  * Multi-label alternation over exactly the labels that can own embedding
- * rows (embedding-pipeline.ts queries EMBEDDABLE_LABELS and nothing else),
- * reserved keywords backtick-escaped via {@link escapeTableName}. Probed on
- * @ladybugdb/core 0.18.0 (this shipping review, FIX 4): the full 19-label
+ * rows: EMBEDDABLE_LABELS plus File, which embedding-pipeline.ts embeds as
+ * the zero-symbol fallback for text-only repositories (#2454). Reserved
+ * keywords are backtick-escaped via {@link escapeTableName}. Probed on
+ * @ladybugdb/core 0.18.0 (this shipping review, FIX 4): the full multi-label
  * alternation parses, executes, and deletes exactly the joined rows —
  * replacing the unlabeled `MATCH (n)` that scanned EVERY node table per
  * chunk (BasicBlock-dominated under `--pdg`) when only embeddable labels
- * can match an embedding row.
+ * can match an embedding row. Including File is free for code repositories:
+ * they never hold File embedding rows, so the extra label joins nothing.
  */
 const embeddableLabelMatch = (): string =>
-  EMBEDDABLE_LABELS.map((l) => escapeTableName(l)).join('|');
+  ['File', ...EMBEDDABLE_LABELS].map((l) => escapeTableName(l)).join('|');
 
 // LADYBUGDB-CONTRACT: matches @ladybugdb/core ^0.18.0 native binder text,
 // probe-recorded: `Binder exception: Table CodeEmbedding does not exist.`
@@ -2673,14 +2770,16 @@ export const loadVectorExtension = async (
 ): Promise<boolean> => {
   const useModuleState = targetConn === undefined;
   if (useModuleState && vectorExtensionLoaded) return true;
-  // INSTALL VECTOR crashes with SIGSEGV on Windows: the KuzuDB native extension
-  // installer has an unhandled error path on Windows that raises a fatal signal
-  // that JS try/catch cannot intercept. Skip loading — vector/embedding search
-  // is unavailable but all graph index queries still work. Do NOT set
-  // vectorExtensionLoaded here: the flag means "successfully loaded", and a
-  // subsequent call would otherwise short-circuit to `return true` at the top.
-  if (process.platform === 'win32') return false;
-  if (!isVectorExtensionSupportedByPlatform()) return false;
+  // No platform gate. Windows was hard-refused here for years on the strength
+  // of an early-era report that in-process INSTALL VECTOR could SIGSEGV
+  // (#1365) — but the extension server ships win_amd64 VECTOR artifacts for
+  // every 0.18.x extension version (probed live: v0.18.0 and v0.18.1 both
+  // serve a real PE32+ DLL; the pinned 0.18.2 core resolves its extension
+  // directory to 0.18.1, strace-verified), and INSTALL now runs in a spawned
+  // child process (installDuckDbExtensionOutOfProcess), so even a crashing
+  // installer kills only the child and degrades to `false` here. LOAD of a
+  // present extension file is an ordinary in-process load whose failures
+  // surface as catchable errors, exactly like FTS.
 
   const c: lbug.Connection | null = targetConn ?? conn;
   if (!c) {
@@ -2790,6 +2889,78 @@ export const createVectorIndex = async (): Promise<boolean> => {
 };
 
 /**
+ * Make DML against {@link EMBEDDING_TABLE_NAME} legal on the writable
+ * connection when it can be, and report whether it is.
+ *
+ * LadybugDB refuses EVERY mutation of a table carrying an HNSW index while
+ * the VECTOR extension is not loaded on that connection: `DELETE` fails with
+ * "Trying to delete from an index on table CodeEmbedding but its extension is
+ * not loaded", `CREATE` with the matching "insert into an index" variant,
+ * `DROP TABLE` is refused while the index references it, and `SET` — even on
+ * a NON-indexed property — segfaults the process outright. Probed against
+ * @ladybugdb/core 0.18.2 (the lockfile-pinned version) and 0.18.0 — every
+ * result identical on both (#2623).
+ *
+ * Dropping the index is NOT an available recovery: `CALL DROP_VECTOR_INDEX`
+ * is itself a VECTOR-extension function and resolves to "Catalog exception:
+ * function DROP_VECTOR_INDEX is not defined" in exactly the state it would
+ * need to rescue. Loading the extension is the only in-place repair, which is
+ * why this returns a verdict instead of attempting a fixup.
+ *
+ * `true` = embedding-row DML is safe: either VECTOR is now loaded, or the
+ * table carries no index to trip over. `false` = genuinely blocked (index
+ * present, extension unloadable); the analyze orchestrator answers that by
+ * escalating to the wipe-and-rebuild write plan instead of failing
+ * mid-writeback.
+ *
+ * Cheap by construction: one local `SHOW_INDEXES` read settles the common
+ * "this repo never built an embedding index" case without touching the
+ * extension machinery at all, so a VECTOR-less machine is not charged a
+ * bounded INSTALL attempt on every incremental analyze. `SHOW_INDEXES` is
+ * readable WITHOUT the extension and reports `extension_loaded` per index, so
+ * no error-string sniffing is needed; it runs through the unprepared
+ * `conn.query()` path like every other `CALL` procedure here (#2114).
+ */
+export const ensureEmbeddingRowDmlSafe = async (): Promise<boolean> => {
+  const targetConn = conn;
+  if (!targetConn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  // Catalog FIRST. The overwhelmingly common case on a repo that never enabled
+  // embeddings is "no index at all", and that is provable with one local read
+  // — no extension needed. Loading first would make every incremental analyze
+  // on a VECTOR-less machine pay a bounded out-of-process INSTALL attempt (the
+  // `auto` policy) plus an "extension unavailable" warning, for a repo that
+  // can never hit this hazard.
+  let indexRows: any[] | undefined;
+  try {
+    indexRows = await withConnLock(async () =>
+      readQueryRows(await targetConn.query('CALL SHOW_INDEXES() RETURN *')),
+    );
+  } catch (err) {
+    // Fall through to the load attempt: unable to prove the index is absent,
+    // so the extension is the only thing that can make DML safe.
+    logger.warn(
+      { err },
+      `Could not read the index catalog to check for a ${EMBEDDING_TABLE_NAME} vector index; ` +
+        'falling back to loading the VECTOR extension.',
+    );
+  }
+  // Any non-HASH index on the embedding table gates DML. Keyed on index TYPE,
+  // not name, so an index built under a different name still counts; the
+  // implicit primary-key HASH index is engine-internal and never gates.
+  const indexGatesDml =
+    indexRows === undefined ||
+    indexRows.some((row) => {
+      const table = row?.table_name ?? row?.[0];
+      if (table !== EMBEDDING_TABLE_NAME) return false;
+      return (row?.index_type ?? row?.[2]) !== 'HASH';
+    });
+  if (!indexGatesDml) return true;
+  return await loadVectorExtension(undefined, { policy: resolveAnalyzeInstallPolicy() });
+};
+
+/**
  * Lazy-create an FTS index, caching the fact in-process.
  *
  * Kept for writable maintenance paths that need to lazily materialize an
@@ -2881,7 +3052,30 @@ export const queryFTS = async (
 };
 
 /**
- * Drop an FTS index
+ * True for the two benign "nothing to drop" `DROP_FTS_INDEX` failures —
+ * both catalog/binder exceptions, LadybugDB's classes for "this name isn't
+ * bound to anything right now" (probe-verified end-to-end through
+ * `dropFTSIndex`'s real `conn.query()` path against @ladybugdb/core
+ * 0.18.x): the named index was never created (`Binder exception: Table <T>
+ * doesn't have an index with name <name>.`), or the FTS extension/function
+ * isn't registered at all (`Catalog exception: function DROP_FTS_INDEX is
+ * not defined...`). A real engine failure — e.g. the `Runtime exception:
+ * FTS index '<name>' is inconsistent: ...` class from #2589 — is a
+ * DIFFERENT exception class (an execution-time failure, not a catalog/bind
+ * lookup miss), so this returns false for it. Anchored to the START of the
+ * message (not a bare substring search): every probed LadybugDB error leads
+ * with its exception class, and anchoring means a future message that merely
+ * mentions "Binder exception" or "Catalog exception" further in in the body
+ * of an otherwise-genuine failure can't be misclassified as benign. Pure
+ * string logic so it is unit-testable without a native LadybugDB connection.
+ */
+export const isBenignDropFtsIndexError = (message: string): boolean =>
+  message.startsWith('Binder exception:') || message.startsWith('Catalog exception:');
+
+/**
+ * Drop an FTS index. Tolerates only {@link isBenignDropFtsIndexError} —
+ * anything else rethrows instead of being silently masked, which previously
+ * let a corrupted index persist across analyze runs undetected.
  */
 export const dropFTSIndex = async (tableName: string, indexName: string): Promise<void> => {
   if (!conn) {
@@ -2890,8 +3084,11 @@ export const dropFTSIndex = async (tableName: string, indexName: string): Promis
 
   try {
     await queryAndDrain(conn, `CALL DROP_FTS_INDEX('${tableName}', '${indexName}')`);
-  } catch {
-    // Index may not exist
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!isBenignDropFtsIndexError(msg)) {
+      throw e;
+    }
   } finally {
     ensuredFTSIndexes.delete(ftsIndexKey(tableName, indexName));
   }

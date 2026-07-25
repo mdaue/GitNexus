@@ -625,18 +625,24 @@ function walkScopeChain(
     const scope = scopes.scopeTree.getScope(currentId);
     if (scope === undefined) return undefined;
 
-    // Local first: a `const x` in this scope shadows any imported `x`.
-    const localBindings = scope.bindings.get(name);
-    if (localBindings !== undefined) {
-      for (const b of localBindings) {
+    // `Object` scopes (object/record literal bodies) are a hoist
+    // boundary only -- their members are reachable via property access,
+    // never bare identifiers, so they contribute nothing to lookup
+    // (#2545/#2551). Still traverse past to the parent.
+    if (scope.kind !== 'Object') {
+      // Local first: a `const x` in this scope shadows any imported `x`.
+      const localBindings = scope.bindings.get(name);
+      if (localBindings !== undefined) {
+        for (const b of localBindings) {
+          if (predicate(b.def)) return b.def;
+        }
+      }
+
+      // Then imported/augmented bindings — only consulted when no local match.
+      const importedBindings = lookupBindingsAt(currentId, name, scopes);
+      for (const b of importedBindings) {
         if (predicate(b.def)) return b.def;
       }
-    }
-
-    // Then imported/augmented bindings — only consulted when no local match.
-    const importedBindings = lookupBindingsAt(currentId, name, scopes);
-    for (const b of importedBindings) {
-      if (predicate(b.def)) return b.def;
     }
 
     currentId = scope.parent;
@@ -662,6 +668,69 @@ export function findCallableBindingInScope(
   return findAllCallableBindingsInScope(startScope, callableName, scopes)[0];
 }
 
+export interface CallableBindingCandidate {
+  readonly def: SymbolDefinition;
+  /** Every visibility path for this definition, in binding precedence order. */
+  readonly bindings: readonly BindingRef[];
+}
+
+function collectCallableBindingCandidates(
+  sources: readonly (readonly BindingRef[] | undefined)[],
+): readonly CallableBindingCandidate[] {
+  const byNodeId = new Map<string, { def: SymbolDefinition; bindings: BindingRef[] }>();
+  for (const source of sources) {
+    if (source === undefined) continue;
+    for (const binding of source) {
+      const def = binding.def;
+      if (def.type !== 'Function' && def.type !== 'Method' && def.type !== 'Constructor') continue;
+      const existing = byNodeId.get(def.nodeId);
+      if (existing === undefined) {
+        byNodeId.set(def.nodeId, { def, bindings: [binding] });
+      } else {
+        existing.bindings.push(binding);
+      }
+    }
+  }
+  return [...byNodeId.values()];
+}
+
+/**
+ * Binding-aware callable lookup for consumers that need visibility evidence.
+ * Unlike `lookupBindingsAt`, duplicate definitions retain every binding path,
+ * so a weaker augmentation can contribute provenance even when a finalized
+ * binding remains the candidate's canonical definition.
+ */
+export function findAllCallableBindingCandidatesInScope(
+  startScope: ScopeId,
+  callableName: string,
+  scopes: ScopeResolutionIndexes,
+): readonly CallableBindingCandidate[] {
+  let currentId: ScopeId | null = startScope;
+  const visited = new Set<ScopeId>();
+  while (currentId !== null) {
+    if (visited.has(currentId)) return [];
+    visited.add(currentId);
+    const scope = scopes.scopeTree.getScope(currentId);
+    if (scope === undefined) return [];
+
+    if (scope.kind !== 'Object') {
+      const lexical = collectCallableBindingCandidates([scope.bindings.get(callableName)]);
+      if (lexical.length > 0) return lexical;
+
+      const candidates = collectCallableBindingCandidates([
+        scopes.bindings.get(currentId)?.get(callableName),
+        scopes.bindingAugmentations.get(currentId)?.get(callableName),
+        collectNamespaceFqnBindings(currentId, callableName, scopes),
+        scopes.workspaceFqnBindings?.get(callableName),
+      ]);
+      if (candidates.length > 0) return candidates;
+    }
+
+    currentId = scope.parent;
+  }
+  return [];
+}
+
 /**
  * Look up all callable bindings (Function/Method/Constructor) by name
  * from the nearest scope in the chain that binds `callableName`.
@@ -683,28 +752,32 @@ export function findAllCallableBindingsInScope(
     const scope = scopes.scopeTree.getScope(currentId);
     if (scope === undefined) return [];
 
-    const out: SymbolDefinition[] = [];
-    const seen = new Set<string>();
-    const pushCallable = (def: SymbolDefinition): void => {
-      if (def.type !== 'Function' && def.type !== 'Method' && def.type !== 'Constructor') return;
-      if (seen.has(def.nodeId)) return;
-      seen.add(def.nodeId);
-      out.push(def);
-    };
+    // `Object` scopes are a hoist boundary only -- see walkScopeChain's
+    // comment (#2545/#2551). Skip lookup here, still traverse to parent.
+    if (scope.kind !== 'Object') {
+      const out: SymbolDefinition[] = [];
+      const seen = new Set<string>();
+      const pushCallable = (def: SymbolDefinition): void => {
+        if (def.type !== 'Function' && def.type !== 'Method' && def.type !== 'Constructor') return;
+        if (seen.has(def.nodeId)) return;
+        seen.add(def.nodeId);
+        out.push(def);
+      };
 
-    const localBindings = scope.bindings.get(callableName);
-    if (localBindings !== undefined) {
-      for (const b of localBindings) {
+      const localBindings = scope.bindings.get(callableName);
+      if (localBindings !== undefined) {
+        for (const b of localBindings) {
+          pushCallable(b.def);
+        }
+      }
+
+      const importedBindings = lookupBindingsAt(currentId, callableName, scopes);
+      for (const b of importedBindings) {
         pushCallable(b.def);
       }
-    }
 
-    const importedBindings = lookupBindingsAt(currentId, callableName, scopes);
-    for (const b of importedBindings) {
-      pushCallable(b.def);
+      if (out.length > 0) return out;
     }
-
-    if (out.length > 0) return out;
     currentId = scope.parent;
   }
   return [];
@@ -762,16 +835,22 @@ export function findCallableBindingsAndAdlBlocker(
       }
     };
 
-    const localBindings = scope.bindings.get(name);
-    if (localBindings !== undefined) {
-      for (const b of localBindings) {
+    // `Object` scopes are a hoist boundary only (#2545/#2551) -- never
+    // reached by C++'s ADL path in practice (no language reusing this
+    // function emits `@scope.object`), guarded for consistency with the
+    // other scope-chain walkers in this file.
+    if (scope.kind !== 'Object') {
+      const localBindings = scope.bindings.get(name);
+      if (localBindings !== undefined) {
+        for (const b of localBindings) {
+          process(b.def);
+        }
+      }
+
+      const importedBindings = lookupBindingsAt(currentId, name, scopes);
+      for (const b of importedBindings) {
         process(b.def);
       }
-    }
-
-    const importedBindings = lookupBindingsAt(currentId, name, scopes);
-    for (const b of importedBindings) {
-      process(b.def);
     }
 
     if (anyBinding) {
@@ -817,6 +896,15 @@ export function populateClassOwnedMembers(parsed: ParsedFile): void {
     const q = def.qualifiedName;
     if (q === undefined || q.length === 0) return;
     if (q.includes('.')) return; // already qualified (dotted)
+    // A synthesized anonymous-class def (Java `$`-chain binary name,
+    // #2550/#2555 — `M3$2`, `EnumWrap$Mode$1`) already carries its
+    // COMPLETE name. Prefixing it (`M3.M3$2`) desyncs from the
+    // structure-phase node id (`M3$2.hook`), so same-named methods
+    // across sibling enum-constant bodies collapse onto the first
+    // body's node via the simple-name fallback (empirically caught in
+    // review). Class-like only: `$`-named MEMBERS (legal in JS/TS)
+    // still qualify normally against their class.
+    if (isClassLike(def.type) && q.includes('$')) return;
     const classQ = classDef.qualifiedName;
     if (classQ === undefined || classQ.length === 0) return;
     (def as { qualifiedName: string }).qualifiedName = `${classQ}.${q}`;
@@ -996,15 +1084,18 @@ export function findExportedDefByName(
     visited.add(currentId);
     const scope = scopes.scopeTree.getScope(currentId);
     if (scope === undefined) break;
-    const local = scope.bindings.get(name);
-    if (local !== undefined) {
-      for (const b of local) {
+    // `Object` scopes are a hoist boundary only (#2545/#2551).
+    if (scope.kind !== 'Object') {
+      const local = scope.bindings.get(name);
+      if (local !== undefined) {
+        for (const b of local) {
+          if (b.def.type === 'Function' || b.def.type === 'Method') return b.def;
+        }
+      }
+      const finalized = lookupBindingsAt(currentId, name, scopes);
+      for (const b of finalized) {
         if (b.def.type === 'Function' || b.def.type === 'Method') return b.def;
       }
-    }
-    const finalized = lookupBindingsAt(currentId, name, scopes);
-    for (const b of finalized) {
-      if (b.def.type === 'Function' || b.def.type === 'Method') return b.def;
     }
     currentId = scope.parent;
   }

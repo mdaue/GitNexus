@@ -14,8 +14,15 @@ import {
   type KotlinResolveContext,
 } from './index.js';
 import { clearCompanionScopes } from './companion-scopes.js';
-import { applyKotlinCaptureSideChannel } from './capture-side-channel.js';
+import {
+  applyKotlinCaptureSideChannel,
+  clearKotlinClassAnnotationFacts,
+} from './capture-side-channel.js';
 import { isKotlinStaticOnly } from './owners.js';
+import { populateKotlinPackageSiblings } from './package-siblings.js';
+import { attachKotlinSpringBeanCandidateMetadata } from './spring-bean-metadata.js';
+import { clearKotlinPackageFacts } from './package-facts.js';
+import { attachKotlinSpringDiMetadata } from './spring-di.js';
 
 /**
  * Kotlin scope resolver for RFC #909 Ring 3.
@@ -68,6 +75,8 @@ export const kotlinScopeResolver: ScopeResolver = {
     // `undefined` because Kotlin has no external resolution config
     // to load.
     clearCompanionScopes();
+    clearKotlinClassAnnotationFacts();
+    clearKotlinPackageFacts();
     return undefined;
   },
 
@@ -112,6 +121,13 @@ export const kotlinScopeResolver: ScopeResolver = {
   propagatesReturnTypesAcrossImports: true,
   collapseMemberCallsByCallerTarget: false,
   hoistTypeBindingsToModule: true,
+  freeCallsRequireInstanceOwnership: true,
+  postExtractSourceTextPolicy: 'uncached-files',
+  populateNamespaceSiblings: populateKotlinPackageSiblings,
+  emitPostResolutionEdges: (graph, parsedFiles, nodeLookup, indexes) => {
+    attachKotlinSpringBeanCandidateMetadata(graph, parsedFiles, nodeLookup, indexes);
+    attachKotlinSpringDiMetadata(graph, parsedFiles, nodeLookup, indexes);
+  },
 };
 
 /**

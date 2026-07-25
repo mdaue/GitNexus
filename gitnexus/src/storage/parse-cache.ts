@@ -55,7 +55,18 @@ import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.j
 // the main thread (the #1983 OOM). Because the two stores share this version,
 // any future change to the `ParsedFile` serialization shape MUST bump
 // SCHEMA_BUMP so both invalidate in lockstep.
-const SCHEMA_BUMP = 12; // #2391 follow-up: extractPythonModuleConstants changed what it EMITS for the same source (binding mutual-exclusivity clears stale imports; RHS refs are snapshotted; `$imp$N` aliases). `moduleConstants` is cached verbatim, so a warm shard built pre-fix would replay stale/WRONG folds and the correctness fixes would silently no-op on upgrade — bump to force re-extraction. (11 = #2391: ExtractedDecoratorRoute gained `routePathExpr`/`routePathOperands` + ParseWorkerResult gained per-file `moduleConstants`. 10 = PR #2200: Property nodes gained `rawDeclaredType` + `annotations` for Spring DI)
+// v21: Java/Kotlin Spring DI facts persist constructor, field/property, and
+// method injection sites plus bean-name and @Primary provider metadata.
+// v20: Java/Kotlin capture side-channels persist package and class-annotation
+// facts for shared Spring Bean resolution.
+// v21: Java local class/enum/record/interface captures use javac-compatible,
+// source-type-relative JLS 13.1 identities and declaration-to-block scopes
+// (#2562).
+// v19: Java enum constant bodies emit E$N Class nodes; anonymous naming uses
+// JLS 13.1 immediate-host chains (#2555).
+// v18: Worker$N anonymous bodies. v17: callable-value-flow operand identity.
+// v16: direct callee identity.
+const SCHEMA_BUMP = 21;
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from

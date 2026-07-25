@@ -8,10 +8,9 @@
  *   1. **Per-name import statements** — `import a, b` and
  *      `from m import x, y` decompose to one match per imported name
  *      (see `import-decomposer.ts`).
- *   2. **Receiver type bindings** — each `function_definition` inside a
- *      class body emits a `@type-binding.self` (or `@type-binding.cls`
- *      for `@classmethod`) capture so Pass-4 attaches the implicit
- *      receiver (see `receiver-binding.ts`).
+ *   2. **Receiver type bindings** — methods emit an implicit `self` / `cls`
+ *      binding, and `__init__` assignments from annotated parameters emit
+ *      class-scoped instance-field bindings (see `receiver-binding.ts`).
  *
  * Pure given the input source text. No I/O, no globals consulted.
  */
@@ -25,13 +24,35 @@ import {
 } from '../../utils/ast-helpers.js';
 import { splitImportStatement } from './import-decomposer.js';
 import { getPythonParser, getPythonScopeQuery } from './query.js';
-import { synthesizeReceiverTypeBinding } from './receiver-binding.js';
+import {
+  synthesizeConstructorFieldTypeBindings,
+  synthesizeReceiverTypeBinding,
+} from './receiver-binding.js';
 import { synthesizeDependsReferences } from './depends-references.js';
 import { computePythonArityMetadata } from './arity-metadata.js';
 import { recordCacheHit, recordCacheMiss } from './cache-stats.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 import { pythonFunctionDefinitionLabel } from './simple-hooks.js';
+import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
+
+const PYTHON_CALLABLE_CAPTURE_OPTIONS = {
+  functionNodeTypes: new Set(['function_definition', 'lambda']),
+  callNodeTypes: new Set(['call']),
+  parameterListNodeTypes: new Set(['parameters', 'argument_list']),
+  parameterNodeTypes: new Set([
+    'identifier',
+    'default_parameter',
+    'typed_parameter',
+    'typed_default_parameter',
+    'list_splat_pattern',
+    'dictionary_splat_pattern',
+  ]),
+  bindingNodeTypes: new Set(['assignment', 'named_expression']),
+  assignmentNodeTypes: new Set(['assignment', 'named_expression']),
+  identifierNodeTypes: new Set(['identifier']),
+  functionScopedValueBindings: true,
+} as const;
 
 export function emitPythonScopeCaptures(
   sourceText: string,
@@ -114,6 +135,7 @@ export function emitPythonScopeCaptures(
       if (fnNode !== null) {
         const synth = synthesizeReceiverTypeBinding(fnNode);
         if (synth !== null) out.push(synth);
+        out.push(...synthesizeConstructorFieldTypeBindings(fnNode));
         for (const depRef of synthesizeDependsReferences(fnNode)) out.push(depRef);
       }
       continue;
@@ -169,6 +191,7 @@ export function emitPythonScopeCaptures(
   }
 
   out.push(...synthesizePythonInheritanceReferences(tree.rootNode));
+  out.push(...synthesizeCallableFlowCaptures(tree.rootNode, PYTHON_CALLABLE_CAPTURE_OPTIONS));
 
   return out;
 }

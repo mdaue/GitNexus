@@ -18,6 +18,7 @@
  */
 
 import type {
+  DefId,
   ParameterTypeClass,
   ParsedFile,
   Reference,
@@ -37,10 +38,13 @@ import type {
 import { resolveCallerGraphId, resolveDefGraphId } from '../graph-bridge/ids.js';
 import type { CalleeIdSink } from '../graph-bridge/callee-id-sink.js';
 import {
+  findAllCallableBindingCandidatesInScope,
   findAllCallableBindingsInScope,
   findCallableBindingInScope,
   findCallableBindingsAndAdlBlocker,
+  findEnclosingClassDef,
   resolveInheritanceBaseInScope,
+  type CallableBindingCandidate,
 } from '../scope/walkers.js';
 import {
   isOverloadAmbiguousAfterNormalization,
@@ -88,11 +92,23 @@ export function emitFreeCallFallback(
      *  fail at the call site. Three-valued; `'unknown'` keeps the
      *  candidate (monotonicity). */
     readonly constraintCompatibility?: ScopeResolver['constraintCompatibility'];
+    /** Platform/language built-in names (e.g. `fetch`, `setTimeout`) that
+     *  are never real repository declarations. Gates the finalize-bucket
+     *  guard below (#2545) -- see `hasGenuineLexicalBinding`. */
+    readonly isBuiltInName?: (name: string) => boolean;
+    /** Instance-ownership gate (#2550): a free call may resolve to a
+     *  `Method` only when the caller's enclosing class chain (self + MRO)
+     *  contains the method's owner. See
+     *  `ScopeResolver.freeCallsRequireInstanceOwnership`. */
+    readonly freeCallsRequireInstanceOwnership?: boolean;
     readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
-    /** Resolved-callee-id capture sink (#2227 U2). Threaded in only under
-     *  `--pdg`; `undefined` ⇒ zero overhead, byte-identity (R4). Captured at
-     *  the CALLS emit below BEFORE the collapsed `seen` dedup (KTD6) so
-     *  same-target multi-line calls are still recorded per site. */
+    /** Call sites owned by a later precise pass (for example callable-value-flow). */
+    readonly skipSites?: ReadonlySet<string>;
+    /** Resolved-callee-id capture sink (#2227 U2). Threaded in under `--pdg`
+     *  OR for callable-flow's direct-target index (#2437, position-filtered);
+     *  `undefined` ⇒ zero overhead, byte-identity (R4). Captured at the CALLS
+     *  emit below BEFORE the collapsed `seen` dedup (KTD6) so same-target
+     *  multi-line calls are still recorded per site. */
     readonly calleeIdSink?: CalleeIdSink;
   } = {},
 ): number {
@@ -118,11 +134,50 @@ export function emitFreeCallFallback(
     options.isCallableVisibleFromCaller === undefined
       ? new Map<string, readonly SymbolDefinition[]>()
       : undefined;
+  const enclosingInstanceOwnerByScope =
+    options.freeCallsRequireInstanceOwnership === true
+      ? new Map<ScopeId, SymbolDefinition | null>()
+      : undefined;
+  const reachableInstanceOwnersByOwner =
+    options.freeCallsRequireInstanceOwnership === true
+      ? new Map<string, ReadonlySet<string>>()
+      : undefined;
+  const instanceOwnerKey = (ownerId: string): string => {
+    const owner = scopes.defs.get(ownerId as DefId);
+    const qualifiedName = owner?.qualifiedName;
+    if (qualifiedName === undefined || qualifiedName === '') return ownerId;
+    const namespacePrefix = owner.namespacePrefix ?? '';
+    return `${namespacePrefix.length}:${namespacePrefix}:${qualifiedName}`;
+  };
+  const isReachableInstanceOwner = (scopeId: ScopeId, ownerId: string): boolean => {
+    let enclosing = enclosingInstanceOwnerByScope?.get(scopeId);
+    if (enclosing === undefined) {
+      enclosing = findEnclosingClassDef(scopeId, scopes) ?? null;
+      enclosingInstanceOwnerByScope?.set(scopeId, enclosing);
+    }
+    if (enclosing === null) return false;
+
+    let owners = reachableInstanceOwnersByOwner?.get(enclosing.nodeId);
+    if (owners === undefined) {
+      const mutableOwners = new Set<string>([instanceOwnerKey(enclosing.nodeId)]);
+      for (const inheritedOwnerId of scopes.methodDispatch.mroFor(enclosing.nodeId)) {
+        mutableOwners.add(instanceOwnerKey(inheritedOwnerId));
+      }
+      owners = mutableOwners;
+      reachableInstanceOwnersByOwner?.set(enclosing.nodeId, owners);
+    }
+    return owners.has(instanceOwnerKey(ownerId));
+  };
 
   for (const parsed of parsedFiles) {
+    const bindingCandidatesByScope =
+      options.freeCallsRequireInstanceOwnership === true
+        ? new Map<ScopeId, Map<string, readonly CallableBindingCandidate[]>>()
+        : undefined;
     for (const site of parsed.referenceSites) {
       if (site.kind !== 'call') continue;
       if (site.explicitReceiver !== undefined) continue;
+      if (options.skipSites?.has(siteKey(parsed.filePath, site)) === true) continue;
 
       // Constructor form (`new User(...)`): resolve the class, then
       // emit CALLS to its explicit Constructor def (when present) or
@@ -188,9 +243,96 @@ export function emitFreeCallFallback(
           // (local shadows import). When a conversion-rank function is
           // available AND the binding scope contains multiple overloads,
           // refine with narrowOverloadCandidates (#1578).
-          fnDef = findCallableBindingInScope(site.inScope, site.name, scopes);
-          if (fnDef !== undefined && options.conversionRankFn !== undefined) {
-            const allCallables = findAllCallableBindingsInScope(site.inScope, site.name, scopes);
+          let bindingCandidates: readonly CallableBindingCandidate[] | undefined;
+          if (bindingCandidatesByScope !== undefined) {
+            let byName = bindingCandidatesByScope.get(site.inScope);
+            if (byName === undefined) {
+              byName = new Map();
+              bindingCandidatesByScope.set(site.inScope, byName);
+            }
+            bindingCandidates = byName.get(site.name);
+            if (bindingCandidates === undefined) {
+              bindingCandidates = findAllCallableBindingCandidatesInScope(
+                site.inScope,
+                site.name,
+                scopes,
+              );
+              byName.set(site.name, bindingCandidates);
+            }
+          }
+          let eligibleBindingCandidates: readonly CallableBindingCandidate[] | undefined;
+          if (bindingCandidates === undefined) {
+            fnDef = findCallableBindingInScope(site.inScope, site.name, scopes);
+          } else {
+            eligibleBindingCandidates = bindingCandidates.filter((candidate) => {
+              const def = candidate.def;
+              if (
+                def.type !== 'Method' ||
+                def.ownerId === undefined ||
+                def.filePath !== parsed.filePath
+              ) {
+                return true;
+              }
+              const ownerReachable = isReachableInstanceOwner(site.inScope, def.ownerId);
+              const staticallyImported = candidate.bindings.some(
+                (binding) => binding.visibility === 'static-member-import',
+              );
+              return ownerReachable || staticallyImported;
+            });
+            fnDef = eligibleBindingCandidates[0]?.def;
+            if (fnDef === undefined && bindingCandidates.length > 0) {
+              recordSuppressedOutcome(options.recordResolutionOutcome, {
+                phase: 'free-call-fallback',
+                filePath: parsed.filePath,
+                name: site.name,
+                range: site.atRange,
+                reason: 'free-call-instance-ownership',
+                candidates: bindingCandidates.map((candidate) => candidate.def),
+              });
+            }
+          }
+          if (
+            fnDef !== undefined &&
+            options.isBuiltInName?.(site.name) === true &&
+            fnDef.filePath === parsed.filePath &&
+            eligibleBindingCandidates?.some((candidate) =>
+              candidate.bindings.some((binding) => binding.visibility === 'static-member-import'),
+            ) !== true &&
+            !hasGenuineLexicalBinding(site.inScope, site.name, scopes)
+          ) {
+            // A platform/language built-in (e.g. `fetch`, `setTimeout`)
+            // with no binding reachable via the TRUE lexical scope chain
+            // (Scope.bindings only) -- the match came solely from
+            // finalize's per-file "local + imports + wildcards" bucket,
+            // which flattens every declaration in the file onto the
+            // module scope regardless of true nesting depth
+            // (gitnexus-shared's `materializeBindings`). That flattening
+            // is correct for its purpose (cross-file import targets) but
+            // over-matches same-file built-in-shadowing declarations that
+            // were never really module-scope-visible -- e.g. a Cloudflare
+            // Worker's `export default { fetch(req) {} }` handler (#2545).
+            // Leave the call unresolved rather than emit a false edge.
+            //
+            // `fnDef.filePath === parsed.filePath` is the load-bearing
+            // guard against a real regression: `materializeBindings`'s
+            // flat bucket is per-file, so the leak this guard targets is
+            // ALWAYS same-file. A cross-file match at this point can only
+            // come from a genuine import/namespace/workspace-FQN channel
+            // (the separate, gated `pickUniqueGlobalCallable` global
+            // fallback runs later and isn't what populated `fnDef` here)
+            // -- e.g. `import { fetch } from './fetch-polyfill'` must
+            // keep resolving. Without this check, that import silently
+            // stopped resolving (verified via a scratch probe fixture).
+            fnDef = undefined;
+          }
+          if (
+            fnDef !== undefined &&
+            (options.conversionRankFn !== undefined || bindingCandidates !== undefined)
+          ) {
+            const allCallables =
+              eligibleBindingCandidates === undefined
+                ? findAllCallableBindingsInScope(site.inScope, site.name, scopes)
+                : eligibleBindingCandidates.map((candidate) => candidate.def);
             if (allCallables.length > 1) {
               const narrowed = narrowOverloadCandidates(
                 allCallables,
@@ -873,4 +1015,34 @@ export function pickImplicitThisOverload(
   });
   if (candidates.length !== 1) return undefined;
   return candidates[0];
+}
+
+/**
+ * True when `name` is bound somewhere along the TRUE lexical scope
+ * chain from `startScope` -- i.e. via `Scope.bindings` (the raw,
+ * nesting-aware per-scope map built during extraction), NOT via
+ * finalize's `indexes.bindings` module-scope bucket (which flattens
+ * every declaration in the file onto the module scope regardless of
+ * true nesting -- see `hasGenuineLexicalBinding`'s caller for why that
+ * distinction matters, #2545).
+ */
+function hasGenuineLexicalBinding(
+  startScope: ScopeId,
+  name: string,
+  scopes: ScopeResolutionIndexes,
+): boolean {
+  let currentId: ScopeId | null = startScope;
+  const visited = new Set<ScopeId>();
+  while (currentId !== null) {
+    if (visited.has(currentId)) return false;
+    visited.add(currentId);
+    const scope = scopes.scopeTree.getScope(currentId);
+    if (scope === undefined) return false;
+    // `Object` scopes (object/record literal bodies) are a hoist
+    // boundary only -- never a genuine lexical binding, not even to
+    // their own nested children (#2551, mirrors scope/walkers.ts).
+    if (scope.kind !== 'Object' && scope.bindings.get(name) !== undefined) return true;
+    currentId = scope.parent;
+  }
+  return false;
 }

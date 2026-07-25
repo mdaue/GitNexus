@@ -5,7 +5,11 @@
 
 import { Command } from 'commander';
 import { createRequire } from 'node:module';
-import { createLazyAction, createLbugLazyAction } from './lazy-action.js';
+import {
+  createAnalyzerLbugLazyAction,
+  createLazyAction,
+  createLbugLazyAction,
+} from './lazy-action.js';
 import { EMBEDDING_DIMS_ERROR, normalizeEmbeddingDims } from './embedding-dims.js';
 import { registerGroupCommands } from './group.js';
 import { localizeCliHelp } from './help-i18n.js';
@@ -89,9 +93,15 @@ program
   )
   .option('--no-stats', 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md')
   .option(
+    '--self-commit',
+    'Auto-commit AGENTS.md/CLAUDE.md changes after analyze (opt-in, off by default). ' +
+      'Scoped to only those two files (never `git add -A`); no-ops if neither exists, ' +
+      'neither changed, or the repo has no git identity configured.',
+  )
+  .option(
     '--skip-skills',
-    'Skip installing standard GitNexus skill files under .claude/skills/gitnexus/. ' +
-      'Does not suppress community skills from --skills (those use .claude/skills/generated/). ' +
+    'Skip installing standard GitNexus skill files directly under .claude/skills/ and .agents/skills/. ' +
+      'Does not suppress community skills from --skills (those use .claude/skills/gitnexus-area-*). ' +
       'Use --index-only to skip all AI-context file injection.',
   )
   .option('--index-only', 'Pure index mode: skip all file injection (AGENTS.md, CLAUDE.md, skills)')
@@ -188,7 +198,14 @@ program
       process.env.GITNEXUS_EMBEDDING_DIMS = dimsEnvBaseline;
     }
   })
-  .action(createLbugLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
+  .action(
+    createAnalyzerLbugLazyAction(
+      () => import('../core/analyzer-identity.js'),
+      () => import('./analyze.js'),
+      'analyzeCommandWithRunnerIdentity',
+      import.meta.url,
+    ),
+  );
 
 program
   .command('index [path...]')
@@ -233,6 +250,8 @@ program
 program
   .command('status')
   .description('Show index status for current repo')
+  .option('--json', 'Emit machine-readable index and analyzer provenance')
+  .addHelpText('after', () => t('help.identityCache.environment'))
   .action(createLazyAction(() => import('./status.js'), 'statusCommand'));
 
 program
@@ -304,6 +323,10 @@ program
   .option('--concurrency <n>', 'Parallel LLM calls (default: 3)', '3')
   .option('--timeout <seconds>', 'LLM request timeout in seconds (default: disabled)')
   .option('--retries <n>', 'Max LLM retry attempts per request (default: 3)')
+  .option(
+    '--allow-insecure-connection <host>',
+    'Allow exact host(s) for http:// LLM base URLs (comma-separated; HTTPS is preferred)',
+  )
   .option('--gist', 'Publish wiki as a public GitHub Gist after generation')
   .option('-v, --verbose', 'Enable verbose output (show LLM commands and responses)')
   .option('--review', 'Stop after grouping to review module structure before generating pages')
@@ -436,7 +459,7 @@ program
   .option('-p, --port <port>', 'Port number', '4848')
   .option(
     '--host <host>',
-    'Bind address (default: 127.0.0.1, use 0.0.0.0 to expose to all interfaces)',
+    'Bind address or resolvable hostname (default: 127.0.0.1; non-loopback requires GITNEXUS_AUTH_TOKEN; hostnames resolve to IPv4)',
   )
   .option('--idle-timeout <seconds>', 'Auto-shutdown after N seconds idle (0 = disabled)', '0')
   .action(createLbugLazyAction(() => import('./eval-server.js'), 'evalServerCommand'));

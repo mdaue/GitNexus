@@ -47,6 +47,7 @@ export type RecoveryHint =
   | 'wal-corruption'
   | 'wal-checkpoint-threshold'
   | 'lbug-wipe-failed'
+  | 'lbug-page-size'
   | 'heap-oom-respawn'
   | 'native-worker-abort'
   | 'hf-endpoint-unreachable'
@@ -58,7 +59,8 @@ export type RecoveryHint =
   | 'npm-resolution'
   | 'module-not-found'
   | 'gitnexusrc-invalid'
-  | 'default-branch-invalid';
+  | 'default-branch-invalid'
+  | 'index-lock-timeout';
 
 /**
  * Common shape for the optional structured-field bag passed to

@@ -52,10 +52,11 @@
     "postinstall": "node scripts/build-tree-sitter-grammars.cjs",
     "assert-publish-coverage": "node scripts/assert-publish-grammar-coverage.cjs",
     "prepare": "node scripts/build.js",
-    "prepack": "node scripts/assert-publish-grammar-coverage.cjs && node scripts/build.js"
+    "prepack": "node scripts/assert-publish-grammar-coverage.cjs && node scripts/build.js",
+    "version": "node scripts/sync-plugin-manifests.mjs"
   },
   "dependencies": {
-    "@ladybugdb/core": "^0.18.0",
+    "@ladybugdb/core": "^0.18.3",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@scarf/scarf": "^1.4.0",
     "busboy": "^1.6.0",
@@ -69,7 +70,7 @@
     "graphology-indices": "^0.17.0",
     "graphology-utils": "^2.3.0",
     "ignore": "^7.0.5",
-    "js-yaml": "^4.1.1",
+    "js-yaml": "^5.0.0",
     "jsonc-parser": "^3.3.1",
     "mnemonist": "^0.40.3",
     "node-addon-api": "^8.0.0",
@@ -96,17 +97,15 @@
     "onnxruntime-node": "^1.24.0"
   },
   "devDependencies": {
-    "@babel/generator": "^7.29.7",
-    "@babel/parser": "^7.29.7",
-    "@babel/traverse": "^7.29.7",
-    "@babel/types": "^7.29.7",
+    "@babel/generator": "^8.0.0",
+    "@babel/parser": "^8.0.0",
+    "@babel/traverse": "^8.0.0",
+    "@babel/types": "^8.0.0",
     "@types/busboy": "^1.5.4",
     "@types/cli-progress": "^3.11.6",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.6",
-    "@types/js-yaml": "^4.0.9",
-    "@types/node": "^25.6.0",
-    "@types/uuid": "^11.0.0",
+    "@types/node": "^26.0.0",
     "@vitest/coverage-v8": "^4.0.18",
     "gitnexus-shared": "file:../gitnexus-shared",
     "tsx": "^4.0.0",
@@ -119,6 +118,6 @@
     }
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": "^22.18.0 || >=24.11.0"
   }
 }

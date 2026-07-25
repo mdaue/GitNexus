@@ -11,8 +11,11 @@
 
 import path from 'path';
 import fs from 'fs/promises';
-import { execFileSync } from 'child_process';
+import { randomUUID } from 'node:crypto';
+import { retryRename } from '../storage/fs-atomic.js';
+import { acquireIndexLock } from '../storage/index-lock.js';
 import { runPipelineFromRepo } from './ingestion/pipeline.js';
+import type { KnowledgeGraph } from './graph/types.js';
 import { resetDegradedParseCounter } from './tree-sitter/safe-parse.js';
 import {
   initLbug,
@@ -24,6 +27,7 @@ import {
   closeLbugBeforeExit,
   loadCachedEmbeddings,
   deleteNodesForFiles,
+  ensureEmbeddingRowDmlSafe,
   deleteAllCommunitiesAndProcesses,
   deleteAllInterprocTaintPaths,
   deleteAllCallSummaries,
@@ -34,9 +38,17 @@ import {
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
 } from './lbug/lbug-adapter.js';
+import {
+  estimateBufferPool,
+  setBufferPoolSizeHint,
+  resolveNativeSafeStorageDir,
+} from './lbug/lbug-config.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
 import {
+  buildSearchIndexesOrDegrade,
+  ftsFailureIsFatal,
   createSearchFTSIndexes,
+  dropSearchFTSIndexes,
   initialiseSearchFTSStemmer,
   verifySearchFTSIndexes,
 } from './search/fts-indexes.js';
@@ -52,7 +64,11 @@ import {
   checkpointOnce,
   type WalCheckpointDriver,
 } from './lbug/wal-checkpoint-driver.js';
-import { quarantineSidecarsForDirtyRecovery } from './lbug/sidecar-recovery.js';
+import {
+  quarantineSidecarsForDirtyRecovery,
+  inspectLbugSidecars,
+} from './lbug/sidecar-recovery.js';
+import type { EmbeddingIdentity } from './embeddings/embedding-identity.js';
 import {
   getStoragePaths,
   resolveBranchPlacement,
@@ -68,6 +84,7 @@ import {
   isMissingFilesystemError,
   INDEX_METADATA_FILE,
   INCREMENTAL_SCHEMA_VERSION,
+  type AnalyzerRunnerIdentity,
   type RepoMeta,
 } from '../storage/repo-manager.js';
 import { DEFAULT_PDG_MAX_FUNCTION_LINES } from './ingestion/cfg/collect.js';
@@ -110,6 +127,7 @@ import {
   getRemoteUrl,
   hasGitDir,
   getInferredRepoName,
+  isWorkingTreeDirty,
   resolveRepoIdentityRoot,
 } from '../storage/git.js';
 import type { CachedEmbedding } from './embeddings/types.js';
@@ -117,6 +135,63 @@ import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
 import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
 import { STALE_HASH_SENTINEL } from './lbug/schema.js';
+import { isSpringBeanCandidateSourceFile } from './ingestion/frameworks/spring/bean-catalog.js';
+import { SPRING_BEAN_INVENTORY_FEATURE } from './ingestion/frameworks/spring/analysis-features.js';
+import { SPRING_CONFIG_BINDINGS_FEATURE } from './ingestion/languages/java/analysis-features.js';
+import {
+  CLASS_FRAMEWORK_ANNOTATIONS_FEATURE,
+  findAnalysisFeatureMismatches,
+  resolveAnalysisFeatureVersions,
+} from './analysis-features.js';
+import {
+  analyzerRunnerIdentitiesEqual,
+  finalizeAnalyzerRunnerIdentity,
+  resolveAnalyzerRunnerIdentity,
+} from './analyzer-identity.js';
+
+const ANALYSIS_FEATURES = [
+  CLASS_FRAMEWORK_ANNOTATIONS_FEATURE,
+  SPRING_BEAN_INVENTORY_FEATURE,
+  SPRING_CONFIG_BINDINGS_FEATURE,
+] as const;
+
+interface PersistedFrameworkAnnotationRow {
+  readonly id?: unknown;
+  readonly frameworkAnnotations?: unknown;
+}
+
+function stringList(value: unknown): readonly string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+}
+
+function collectFrameworkAnnotationDriftFiles(
+  graph: KnowledgeGraph,
+  persistedRows: readonly PersistedFrameworkAnnotationRow[],
+): Set<string> {
+  const persistedById = new Map<string, readonly string[]>();
+  for (const row of persistedRows) {
+    if (typeof row.id === 'string') {
+      persistedById.set(row.id, stringList(row.frameworkAnnotations));
+    }
+  }
+
+  const driftFiles = new Set<string>();
+  graph.forEachNode((node) => {
+    if (node.label !== 'Class') return;
+    const current = stringList(node.properties.frameworkAnnotations);
+    const persisted = persistedById.get(node.id) ?? [];
+    if (
+      current.length !== persisted.length ||
+      current.some((annotation, index) => annotation !== persisted[index])
+    ) {
+      const filePath = node.properties.filePath;
+      if (typeof filePath === 'string') driftFiles.add(filePath);
+    }
+  });
+  return driftFiles;
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -161,7 +236,7 @@ export interface AnalyzeOptions {
   skipAgentsMd?: boolean;
   /** Omit volatile symbol/relationship counts from AGENTS.md and CLAUDE.md. */
   noStats?: boolean;
-  /** Skip installing standard GitNexus skill files to .claude/skills/gitnexus/. */
+  /** Skip installing standard GitNexus skill files directly under .claude/skills/. */
   skipSkills?: boolean;
   /**
    * Build the CFG/PDG substrate (#2081 M1). Forwarded to `PipelineOptions.pdg`,
@@ -209,6 +284,11 @@ export interface AnalyzeOptions {
    *  `DEFAULT_PDG_EMIT_CHUNK_ROWS`. May also be set via
    *  `GITNEXUS_PDG_EMIT_CHUNK_SIZE`. Memory-only (#2202). */
   pdgEmitChunkSize?: number;
+  /** Streamed structural graph emit (#2680). Honored only on a full rebuild
+   *  (`force === true`). May also be enabled via `GITNEXUS_STREAM_GRAPH_EMIT`.
+   *  Trades community detection, process extraction and PDG taint summaries for
+   *  a ~2.9x reduction of in-memory graph heap. */
+  streamGraphEmit?: boolean;
   /**
    * Default branch threaded into generated AGENTS.md / CLAUDE.md so the
    * regression-compare example uses the configured branch instead of a
@@ -290,6 +370,15 @@ export interface AnalyzeResult {
    * the persisted meta surface the degraded state instead of reporting healthy.
    */
   ftsSkipped?: boolean;
+  /**
+   * Why FTS was skipped, when `ftsSkipped` is true (#2658 review L2):
+   * `extension-unavailable` (the LadybugDB FTS extension could not load — the
+   * offline-first case, remedied by installing it) vs `build-failed` (the
+   * extension loaded but the index build/verify failed non-fatally — remedied by
+   * `--repair-fts`, not by installing the extension). Lets the CLI show the
+   * correct recovery hint instead of always blaming a missing extension.
+   */
+  ftsSkipReason?: 'extension-unavailable' | 'build-failed';
   /**
    * True when the index this run produced/validated is the flat workspace
    * slot (#2106 R2, inverted by #2354 to follow the checked-out branch).
@@ -506,6 +595,38 @@ export const resolveStreamPdgEmit = (options: {
   (options.streamPdgEmit === true || parseTruthyEnv(process.env.GITNEXUS_STREAM_PDG_EMIT));
 
 /**
+ * Resolve whether streamed structural graph emit is on for this run (#2680).
+ *
+ * **On by default.** It costs nothing observable: the sink answers a complete
+ * relationship read, so community detection, process extraction, the taint
+ * fixpoint and the local-symbol pruner all behave exactly as they do without it
+ * — the edges simply live in columns and on disk instead of as objects. There is
+ * no reason to make a user opt in to using less memory.
+ *
+ * Two conditions still bound it:
+ *
+ * - `force === true`. Sound only on a full rebuild, because the incremental
+ *   writeback (`extractChangedSubgraph`) reads relationships back out of the
+ *   in-memory graph. Same gate, and same reason, as {@link resolveStreamPdgEmit}.
+ * - `GITNEXUS_STREAM_GRAPH_EMIT=0` (or an explicit `streamGraphEmit: false`)
+ *   turns it off. The escape hatch exists for bisecting a suspected
+ *   streaming-related fault, not as a routine choice.
+ *
+ * Memory-only: not part of {@link resolvePdgConfig}, so toggling never trips
+ * `pdgModeMismatch`. Read every call (not memoized) so `vi.stubEnv` works.
+ */
+export const resolveStreamGraphEmit = (options: {
+  force?: boolean;
+  streamGraphEmit?: boolean;
+}): boolean => {
+  if (options.force !== true) return false;
+  if (options.streamGraphEmit !== undefined) return options.streamGraphEmit;
+  // Unset ⇒ on. Set ⇒ honour it, so `=0` / `=false` is the escape hatch.
+  const raw = process.env.GITNEXUS_STREAM_GRAPH_EMIT;
+  return raw === undefined || raw === '' ? true : parseTruthyEnv(raw);
+};
+
+/**
  * Resolve the streamed PDG-emit write-buffer size (#2202). Explicit option wins
  * over `GITNEXUS_PDG_EMIT_CHUNK_SIZE`; `undefined` ⇒ the sink's
  * `DEFAULT_PDG_EMIT_CHUNK_ROWS`. Memory-only; does not affect emitted bytes.
@@ -557,65 +678,50 @@ export const pdgModeMismatch = (recorded: RepoMeta['pdg'], options: PdgOptions):
   return false;
 };
 
-export async function runFullAnalysis(
-  repoPath: string,
-  options: AnalyzeOptions,
-  callbacks: AnalyzeCallbacks,
-): Promise<AnalyzeResult> {
-  const log = (msg: string) => callbacks.onLog?.(msg);
-  const progress = (phase: string, percent: number, message: string) =>
-    callbacks.onProgress(phase, percent, message);
+/**
+ * The storage paths + resolved branch placement a run will write to. Computed
+ * once, up front, so the `runFullAnalysis` wrapper can lock the ACTUAL write
+ * directory (#2658). `metaDir` — not `getStoragePaths(repoPath, options.branch)`
+ * — is the lock scope: a `--branch X` that owns the flat slot resolves to the
+ * flat `.gitnexus`, so scoping off the raw option would lock the wrong dir.
+ */
+interface WriteTarget {
+  storagePath: string;
+  repoHasGit: boolean;
+  currentCommit: string;
+  checkedOutBranch: string | null;
+  branchLabel: string | null;
+  placement: { branch?: string };
+  lbugPath: string;
+  metaPath: string;
+  metaDir: string;
+}
 
-  // Resolve + validate operator-provided FTS config once, before the expensive
-  // parse/load phases. A typo fails here in ms; createSearchFTSIndexes reuses
-  // the cached value via getSearchFTSStemmer.
-  initialiseSearchFTSStemmer();
-  initialiseSearchFTSCjkSegmentation();
-
-  // Scope the degraded-parse log throttle to this run. On a reused process
-  // (e.g. tests, or any host that calls runFullAnalysis more than once) the
-  // module-level counter would otherwise stay saturated and suppress every
-  // degraded-parse log after the first run. The per-parse worker holds its own
-  // counter in its own module instance and is process-scoped, so no separate
-  // worker-side reset is needed (see safe-parse.ts ParseTimeoutError contract).
-  resetDegradedParseCounter();
-
+/**
+ * Resolve which storage slot this analyze writes to, including branch
+ * placement (#2106/#2354). Extracted from the top of the pipeline so the lock
+ * scope (`metaDir`) is known before the lock is acquired. Throws the same
+ * `--branch` / checked-out mismatch error the pipeline used to throw inline, so
+ * that failure still surfaces before any lock is taken.
+ */
+async function resolveWriteTarget(repoPath: string, options: AnalyzeOptions): Promise<WriteTarget> {
   // `storagePath` is ALWAYS the flat `.gitnexus` — content-addressed caches
-  // (parse-cache, parsedfile-store) and the kuzu-migration cleanup live there
-  // and are shared across branches (#2106 KTD7).
+  // (parse-cache, parsedfile-store) and kuzu-migration cleanup live there and
+  // are shared across branches (#2106 KTD7).
   const { storagePath } = getStoragePaths(repoPath);
-
-  // Clean up stale KuzuDB files from before the LadybugDB migration.
-  const kuzuResult = await cleanupOldKuzuFiles(storagePath);
-  if (kuzuResult.found && kuzuResult.needsReindex) {
-    log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
-  }
-
   const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
-
-  // ── #2106/#2354: resolve which branch slot this run writes to ─────────
-  // `branchLabel` is the branch identity recorded in meta.json (incl. the
-  // flat workspace slot). `placement.branch` is undefined for the flat slot
-  // (the lbug/meta paths stay byte-identical to single-branch behavior) and
-  // set for a `branches/<slug>/` sub-directory. Only an explicit `--branch`
-  // can route to a sub-directory; a plain analyze ALWAYS targets the flat
-  // slot, which follows the checked-out working tree (#2354) — the
-  // auto-detected branch (null for detached HEAD / non-git) is recorded as
-  // the slot's informational label only.
   // Normalize the auto-detected branch the same way an explicit `--branch` is
-  // validated (#2106 R1): a git ref the branch-name rules forbid (backtick,
-  // `~ ^ : ? *`, leading `-`, `..`) becomes `null` → the flat slot, matching
-  // that a later `--branch <that-ref>` query would also be rejected. A normal
-  // ref passes through unchanged so index-time and query-time labels round-trip.
+  // validated (#2106 R1): a git ref the branch-name rules forbid becomes `null`
+  // → the flat slot, matching that a later `--branch <that-ref>` query would
+  // also be rejected. A normal ref round-trips index-time/query-time labels.
   const checkedOutBranch = repoHasGit
     ? (sanitizeDetectedBranch(getCurrentBranch(repoPath)) ?? null)
     : null;
   // Analyze indexes the working tree, not an arbitrary ref. An explicit
   // `--branch X` while a DIFFERENT branch Y is checked out would write Y's
-  // content (and Y's commit) into X's index slot, corrupting X (#2106). Refuse
-  // the mismatch. Detached HEAD / non-git (checkedOutBranch === null) still
-  // allow an explicit label so CI checkouts can name their snapshot.
+  // content into X's slot, corrupting X (#2106). Refuse the mismatch. Detached
+  // HEAD / non-git (checkedOutBranch === null) still allow an explicit label.
   if (options.branch && checkedOutBranch && options.branch !== checkedOutBranch) {
     throw new Error(
       `--branch "${options.branch}" does not match the checked-out branch "${checkedOutBranch}". ` +
@@ -625,9 +731,137 @@ export async function runFullAnalysis(
   const branchLabel = options.branch ?? checkedOutBranch;
   const placement = options.branch ? await resolveBranchPlacement(repoPath, branchLabel) : {};
   const { lbugPath, metaPath } = getStoragePaths(repoPath, placement.branch);
-  // metaPath now points to the metadata file (gitnexus.json) in a branch-specific directory.
-  // metaDir is the directory containing the metadata file (and branch-specific DBs).
-  const metaDir = path.dirname(metaPath);
+  return {
+    storagePath,
+    repoHasGit,
+    currentCommit,
+    checkedOutBranch,
+    branchLabel,
+    placement,
+    lbugPath,
+    metaPath,
+    metaDir: path.dirname(metaPath),
+  };
+}
+
+/**
+ * Run the full analysis under an exclusive, index-directory-scoped write lock
+ * (#2658). A second concurrent `analyze` on the same slot waits here for the
+ * first to finish, then falls through to the normal freshness check inside —
+ * so a run whose work the holder already did returns `alreadyUpToDate` in
+ * seconds instead of rebuilding (single-flight coalescing), while a run for a
+ * genuinely-changed tree does one follow-up incremental. No new flag: waiting
+ * is the default, which is what hook-driven re-index wants.
+ *
+ * The lock is held by whichever process runs the pipeline (the heap-respawn
+ * child, or the original) — see index-lock.ts for why ownership lives with the
+ * writer, not a supervising parent. Released as soon as the write completes or
+ * throws; the post-analysis steps in the CLI (skills, registry) run lock-free.
+ */
+export async function runFullAnalysis(
+  repoPath: string,
+  options: AnalyzeOptions,
+  callbacks: AnalyzeCallbacks,
+  runnerIdentityAtBootstrap?: AnalyzerRunnerIdentity,
+): Promise<AnalyzeResult> {
+  // Validate operator-provided FTS config before anything else — a typo fails
+  // here in ms, without taking the lock. (createSearchFTSIndexes reuses the
+  // cached value via getSearchFTSStemmer.)
+  initialiseSearchFTSStemmer();
+  initialiseSearchFTSCjkSegmentation();
+  // Scope the degraded-parse log throttle to this run (module-level counter
+  // would otherwise stay saturated on a reused process).
+  resetDegradedParseCounter();
+
+  const log = (msg: string) => callbacks.onLog?.(msg);
+  const acquireOpts = {
+    log,
+    onWaitStart: () =>
+      callbacks.onProgress('lock', 0, 'Waiting for another analyze to finish on this index…'),
+  };
+
+  let writeTarget = await resolveWriteTarget(repoPath, options);
+  let lock = await acquireIndexLock(writeTarget.metaDir, acquireOpts);
+  try {
+    // #2658 review H2: acquireIndexLock can wait up to the timeout ceiling,
+    // during which git HEAD/branch — and thus the resolved write slot — may
+    // change (a commit lands, a branch is switched, or another writer adopts the
+    // flat slot). The pre-wait snapshot must NOT be reused: re-resolve UNDER the
+    // lock so the freshness check (`existingMeta.lastCommit === currentCommit`)
+    // and the meta stamps see current git state, honoring the module's "re-check
+    // freshness after acquiring" contract. If the slot itself moved we hold the
+    // WRONG lock — release and re-acquire the correct one. Bounded so a
+    // pathologically churning checkout can't loop forever; after the cap we
+    // proceed on the current lock. The loop is INSIDE the try so a re-resolve
+    // that throws (e.g. a `--branch` that stopped matching the now-switched
+    // checkout) still releases the held lock via `finally` (no leak).
+    const MAX_RELOCK = 3;
+    for (let attempt = 0; attempt < MAX_RELOCK; attempt++) {
+      const fresh = await resolveWriteTarget(repoPath, options);
+      if (fresh.metaDir === writeTarget.metaDir) {
+        writeTarget = fresh; // same slot — adopt the freshly-read commit/branch/placement
+        break;
+      }
+      log(
+        `Index write target moved while waiting for the lock ` +
+          `(${writeTarget.metaDir} → ${fresh.metaDir}); re-acquiring the correct slot.`,
+      );
+      lock.release();
+      writeTarget = fresh;
+      lock = await acquireIndexLock(fresh.metaDir, acquireOpts);
+      if (attempt === MAX_RELOCK - 1) {
+        log('Index write target still moving after repeated re-acquire; proceeding on this lock.');
+      }
+    }
+    return await runFullAnalysisInner(
+      repoPath,
+      options,
+      callbacks,
+      writeTarget,
+      runnerIdentityAtBootstrap,
+    );
+  } finally {
+    lock.release();
+  }
+}
+
+async function runFullAnalysisInner(
+  repoPath: string,
+  options: AnalyzeOptions,
+  callbacks: AnalyzeCallbacks,
+  writeTarget: WriteTarget,
+  runnerIdentityAtBootstrap?: AnalyzerRunnerIdentity,
+): Promise<AnalyzeResult> {
+  const log = (msg: string) => callbacks.onLog?.(msg);
+  const progress = (phase: string, percent: number, message: string) =>
+    callbacks.onProgress(phase, percent, message);
+
+  // Streamed structural emit (#2680), resolved once so the pipeline flag and the
+  // CSV-dir resolution below cannot disagree.
+  const streamGraphEmitActive = resolveStreamGraphEmit(options);
+
+  // FTS-config validation and the degraded-parse counter reset happen in the
+  // `runFullAnalysis` wrapper (before the lock is taken).
+
+  // Write target (storage paths + resolved branch placement) was computed by
+  // the `runFullAnalysis` wrapper — which needs `metaDir` up front to acquire
+  // the exclusive index lock BEFORE any of the freshness/write work below
+  // (#2658). `storagePath` is ALWAYS the flat `.gitnexus`; `placement.branch`
+  // selects a `branches/<slug>/` sub-slot only for an explicit `--branch` that
+  // does not own the flat slot. See resolveWriteTarget for the full contract.
+  const { storagePath, repoHasGit, currentCommit, branchLabel, placement, lbugPath, metaDir } =
+    writeTarget;
+
+  // Start each analyze with a clean buffer-pool hint: any pre-pipeline DB open
+  // (e.g. the embeddings-cache open) falls back to the default until the hint is
+  // set from the built graph below, so a prior run's size can't leak in.
+  setBufferPoolSizeHint(undefined);
+
+  // Clean up stale KuzuDB files from before the LadybugDB migration.
+  const kuzuResult = await cleanupOldKuzuFiles(storagePath);
+  if (kuzuResult.found && kuzuResult.needsReindex) {
+    log('Migrating from KuzuDB to LadybugDB — rebuilding index...');
+  }
 
   // Keep gitnexus.json and the legacy meta.json mirror in sync (fresher
   // indexedAt wins; nothing is deleted). Best-effort: loadMeta has its own
@@ -760,6 +994,54 @@ export async function runFullAnalysis(
     }
   }
 
+  // Resolve once per real analysis run so every successful metadata write
+  // carries one coherent receipt. The FTS-only repair path above intentionally
+  // returns without restamping: it does not regenerate the graph represented by
+  // RepoMeta and therefore must not claim a new analyzer identity.
+  const runnerIdentity =
+    runnerIdentityAtBootstrap ?? resolveAnalyzerRunnerIdentity(import.meta.url);
+  if (!analyzerRunnerIdentitiesEqual(runnerIdentity, runnerIdentity)) {
+    throw new Error('Analyzer bootstrap supplied a malformed runner identity receipt');
+  }
+
+  let resumeEmbeddingCheckpoint = false;
+  let pendingEmbeddingNodeIds = new Set<string>();
+  let embeddingIdentityForRun: EmbeddingIdentity | undefined;
+  if (existingMeta?.embeddingCheckpoint) {
+    if (options.dropEmbeddings) {
+      log('Discarding the interrupted embedding checkpoint (--drop-embeddings).');
+      options = { ...options, force: true };
+    } else {
+      const { resolveEmbeddingIdentity } = await import('./embeddings/embedding-identity.js');
+      embeddingIdentityForRun = resolveEmbeddingIdentity();
+      const checkpoint = existingMeta.embeddingCheckpoint;
+      if (checkpoint.provider !== embeddingIdentityForRun.provider) {
+        throw new Error(
+          'Cannot resume embedding checkpoint: the embedding provider configuration differs. ' +
+            'Restore the matching endpoint configuration or pass --drop-embeddings to rebuild without it.',
+        );
+      }
+      if (
+        checkpoint.model !== embeddingIdentityForRun.model ||
+        checkpoint.dimensions !== embeddingIdentityForRun.dimensions
+      ) {
+        throw new Error(
+          `Cannot resume embedding checkpoint: it uses ${checkpoint.model} at ` +
+            `${checkpoint.dimensions} dimensions, but this run resolves ` +
+            `${embeddingIdentityForRun.model} at ${embeddingIdentityForRun.dimensions}. ` +
+            'Restore the matching embedding configuration or pass --drop-embeddings to rebuild without it.',
+        );
+      }
+      resumeEmbeddingCheckpoint = true;
+      pendingEmbeddingNodeIds = new Set(checkpoint.pendingNodeIds ?? []);
+      log(
+        `Previous analyze ended at an embedding checkpoint ` +
+          `(${checkpoint.nodesProcessed}/${checkpoint.totalNodes} nodes); resuming from persisted hashes` +
+          `${pendingEmbeddingNodeIds.size > 0 ? ` and regenerating ${pendingEmbeddingNodeIds.size} pending node(s)` : ''}.`,
+      );
+    }
+  }
+
   // ── Crash recovery: dirty flag forces full rebuild ────────────────
   // If the previous incremental run set incrementalInProgress and didn't
   // clear it, the on-disk index may be in a half-state. Cheapest path
@@ -885,6 +1167,50 @@ export async function runFullAnalysis(
     options = { ...options, force: true };
   }
 
+  // ── independently-versioned analysis capabilities ────────────────
+  // `schemaVersion` is reserved for graph-wide incremental invariants. Some
+  // persisted semantics apply only to repositories containing relevant source
+  // files, so they carry exact feature versions instead. This guard must also
+  // run before alreadyUpToDate: current main and this PR both use schema v8,
+  // while pre-PR v8 indexes lack the Class frameworkAnnotations column and
+  // Java/Kotlin Bean evidence.
+  const persistedFilePaths = Object.keys(existingMeta?.fileHashes ?? {});
+  const expectedPersistedAnalysisFeatures = resolveAnalysisFeatureVersions(
+    ANALYSIS_FEATURES,
+    persistedFilePaths,
+  );
+  const persistedAnalysisFeatureMismatches = existingMeta
+    ? findAnalysisFeatureMismatches(
+        existingMeta.analysisFeatures,
+        expectedPersistedAnalysisFeatures,
+      )
+    : [];
+  let analysisFeatureMismatchLogged = false;
+  if (existingMeta && persistedAnalysisFeatureMismatches.length > 0) {
+    log(
+      `analysis capabilities changed (${persistedAnalysisFeatureMismatches.join(', ')}); ` +
+        `forcing a full rebuild so persisted feature evidence is complete.`,
+    );
+    options = { ...options, force: true };
+    analysisFeatureMismatchLogged = true;
+  }
+
+  // Analyzer provenance is part of freshness, not merely diagnostics. A
+  // same-commit fast path must not preserve metadata produced by an older,
+  // malformed, or dependency/native-different runner. Force a real rebuild so
+  // the graph and its schema-v4 receipt are finalized atomically together.
+  if (existingMeta && !analyzerRunnerIdentitiesEqual(existingMeta.runnerIdentity, runnerIdentity)) {
+    const stampedRunnerSchema = (
+      existingMeta.runnerIdentity as { schemaVersion?: unknown } | undefined
+    )?.schemaVersion;
+    log(
+      `analyzer runner identity changed (stamped schema ${String(stampedRunnerSchema ?? 'missing')}, ` +
+        `this build uses schema ${runnerIdentity.schemaVersion}); forcing a full rebuild so the ` +
+        'index provenance matches the analyzer and dependency/native runtime that produced it.',
+    );
+    options = { ...options, force: true };
+  }
+
   if (
     existingMeta &&
     cjkSegmentationModeMismatch(existingMeta.cjkSegmentation, getSearchFTSCjkSegmentation())
@@ -898,7 +1224,12 @@ export async function runFullAnalysis(
   }
 
   // ── Early-return: already up to date ──────────────────────────────
-  if (existingMeta && !options.force && existingMeta.lastCommit === currentCommit) {
+  if (
+    existingMeta &&
+    !existingMeta.embeddingCheckpoint &&
+    !options.force &&
+    existingMeta.lastCommit === currentCommit
+  ) {
     // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes
     if (currentCommit !== '') {
       // For git repos, even if HEAD matches lastCommit, the working tree
@@ -913,36 +1244,7 @@ export async function runFullAnalysis(
       // Counting them as dirty would perpetually defeat the up-to-date
       // fast path because the previous analyze just wrote them
       // (regression vs PR #1233 behavior).
-      const dirty = (() => {
-        try {
-          const out = execFileSync(
-            'git',
-            [
-              'status',
-              '--porcelain',
-              '--',
-              '.',
-              ':(exclude).gitnexus',
-              ':(exclude).gitnexus/**',
-              ':(exclude).claude',
-              ':(exclude).claude/**',
-              ':(exclude).cursor',
-              ':(exclude).cursor/**',
-              ':(exclude)AGENTS.md',
-              ':(exclude)CLAUDE.md',
-            ],
-            {
-              cwd: repoPath,
-              stdio: ['ignore', 'pipe', 'ignore'],
-              windowsHide: true,
-              encoding: 'utf8',
-            },
-          );
-          return out.trim().length > 0;
-        } catch {
-          return true; // conservative on git failure
-        }
-      })();
+      const dirty = isWorkingTreeDirty(repoPath);
       // Registration wrinkle around the fast path (#2264). A prior
       // `analyze --name X` that hit a name collision writes meta.json (meta-save
       // runs before registerRepo) then fails before registering, leaving the
@@ -1031,9 +1333,11 @@ export async function runFullAnalysis(
   const {
     forceRegenerateEmbeddings,
     preserveExistingEmbeddings,
-    shouldGenerateEmbeddings,
-    shouldLoadCache,
+    shouldGenerateEmbeddings: derivedShouldGenerateEmbeddings,
+    shouldLoadCache: derivedShouldLoadCache,
   } = _deriveEmbeddingMode(options, existingEmbeddingCount);
+  const shouldGenerateEmbeddings = derivedShouldGenerateEmbeddings || resumeEmbeddingCheckpoint;
+  const shouldLoadCache = derivedShouldLoadCache || resumeEmbeddingCheckpoint;
 
   if (options.dropEmbeddings && existingEmbeddingCount > 0) {
     log(
@@ -1133,6 +1437,16 @@ export async function runFullAnalysis(
       // offloaded BasicBlock layer. Memory-only; byte-identical output.
       streamPdgEmit: resolveStreamPdgEmit(options),
       pdgEmitChunkSize: resolvePdgEmitChunkSize(options),
+      // Streamed structural emit (#2680) — same full-rebuild gate as the PDG
+      // toggle above, for the same incremental-writeback reason.
+      streamGraphEmit: streamGraphEmitActive,
+      // Resolved ONLY when streaming is active: on a Windows non-ASCII storage
+      // path this helper mkdtempSyncs a real directory, so evaluating it
+      // unconditionally would leak one temp dir per analyze even with the flag
+      // off. The PDG sibling resolves inside its guard for the same reason.
+      graphEmitCsvDir: streamGraphEmitActive
+        ? resolveNativeSafeStorageDir(storagePath, 'graph-csv')
+        : undefined,
       fetchWrappers: options.fetchWrappers,
     },
   );
@@ -1151,6 +1465,24 @@ export async function runFullAnalysis(
     }
   });
   const newFileHashes = await computeFileHashes(repoPath, allFilePaths);
+  const currentAnalysisFeatures = resolveAnalysisFeatureVersions(ANALYSIS_FEATURES, allFilePaths);
+  const currentAnalysisFeatureMismatches = existingMeta
+    ? findAnalysisFeatureMismatches(existingMeta.analysisFeatures, currentAnalysisFeatures)
+    : [];
+  if (
+    existingMeta &&
+    currentAnalysisFeatureMismatches.length > 0 &&
+    !analysisFeatureMismatchLogged
+  ) {
+    // Covers a repository gaining or losing its first applicable source file:
+    // the persisted file list cannot predict that transition before the
+    // pipeline, but an incremental top-up would leave unchanged rows incomplete.
+    log(
+      `analysis capabilities changed (${currentAnalysisFeatureMismatches.join(', ')}); ` +
+        `forcing a full rebuild so persisted feature evidence is complete.`,
+    );
+    options = { ...options, force: true };
+  }
 
   // Decide incremental vs full at THIS point (post-pipeline, pre-DB).
   // All eligibility conditions are checked here against the actual
@@ -1162,6 +1494,7 @@ export async function runFullAnalysis(
     !options.force &&
     !!existingMeta &&
     existingMeta.schemaVersion === INCREMENTAL_SCHEMA_VERSION &&
+    currentAnalysisFeatureMismatches.length === 0 &&
     !!existingMeta.fileHashes &&
     Object.keys(existingMeta.fileHashes).length > 0 &&
     repoHasGit &&
@@ -1170,6 +1503,59 @@ export async function runFullAnalysis(
   const hashDiff = isIncremental
     ? diffFileHashes(newFileHashes, existingMeta!.fileHashes)
     : undefined;
+
+  // #2 atomic index publish: on a full rebuild, build the fresh DB at a temp
+  // path and swap it over the live index in one rename at the very end, so a
+  // concurrent MCP reader opening mid-build only ever sees the previous
+  // complete index (never a wiped/half-built file) and a crash leaves the old
+  // index intact. The whole build flows through the singleton connection, so
+  // only initLbug/wipeLbugDbFiles below take the temp target.
+  //
+  // POSIX only: the common CLI/serve-worker analyze paths skip the native close
+  // (closeLbugBeforeExit, #2264) and leave the build handle open at swap time.
+  // POSIX renames an open file cleanly; a same-process open handle blocks the
+  // rename on Windows. Windows keeps the current in-place behavior
+  // (buildPath === lbugPath, no swap) until that is resolved (see §12/follow-up).
+  const isFullRebuild = !(isIncremental && hashDiff);
+  // Where the swap is allowed:
+  //  - POSIX renames an open file, so the usual skip-native-close (#2264) is
+  //    fine and the swap always applies.
+  //  - Windows can swap only when a real close is safe to release the build
+  //    handle before the rename — i.e. NOT a --pdg run (the #2264 destructor
+  //    crash). Unverified on Windows CI; falls back to in-place otherwise.
+  const posixSwap = process.platform !== 'win32';
+  // #2614 Windows: the forced real-close before the rename re-bets that #2264 is
+  // --pdg-only, which is unproven (the CLI/worker skip the native close
+  // UNCONDITIONALLY) and unverifiable without a Windows runner. Keep it opt-in
+  // (GITNEXUS_ATOMIC_WINDOWS_SWAP=1) so the default Windows analyze stays on the
+  // proven in-place path; enable it only to test the Windows swap.
+  const windowsSwapOk =
+    process.platform === 'win32' &&
+    options.pdg !== true &&
+    process.env.GITNEXUS_ATOMIC_WINDOWS_SWAP === '1';
+  // Incremental atomicity copies the whole index into the temp before mutating
+  // it, which negates incremental's speed premise — so it is opt-in
+  // (GITNEXUS_ATOMIC_INCREMENTAL=1) pending a benchmark. Full rebuilds always
+  // swap where the platform allows.
+  const wantAtomicIncremental =
+    isIncremental && !!hashDiff && process.env.GITNEXUS_ATOMIC_INCREMENTAL === '1';
+  // #2614 F3: the copy-then-swap stages ONLY the main lbug file, so a live index
+  // carrying an orphan .wal/.shadow (a silently-failed prior checkpoint) would
+  // be copied incompletely and lose that delta. Only take the atomic path when
+  // the live index is a consolidated single file; otherwise fall back to the
+  // in-place writeback, which the next open replays correctly.
+  const atomicIncremental =
+    wantAtomicIncremental && (await inspectLbugSidecars(lbugPath)).kind === 'clean';
+  if (wantAtomicIncremental && !atomicIncremental) {
+    log('atomic-incremental: live index carries orphan sidecars — using in-place writeback');
+  }
+  const useAtomicSwap = (isFullRebuild || atomicIncremental) && (posixSwap || windowsSwapOk);
+  // #2658: a per-run staging name (was the fixed `lbug.new`). Even under the
+  // single-writer lock, a unique name means a crashed run's half-built staging
+  // file can never be mistaken for — or clobber — a live run's; the lock's
+  // orphan sweep (sweepStagingArtifacts) reclaims stragglers on the next
+  // acquire. The `.staging.` prefix is what that sweep matches.
+  const buildPath = useAtomicSwap ? `${lbugPath}.staging.${randomUUID()}` : lbugPath;
 
   if (isIncremental && hashDiff) {
     log(
@@ -1193,6 +1579,14 @@ export async function runFullAnalysis(
         directWriteCount: hashDiff.toWrite.length,
       },
     });
+    if (atomicIncremental) {
+      // Stage the live index into the temp so the in-place delete/writeback
+      // below mutates the COPY, and the end-of-run swap publishes it atomically.
+      // Clear any stale temp first (a crashed run), then copy the (consolidated,
+      // single-file) live index. Whole-file copy — hence opt-in.
+      await wipeLbugDbFiles(buildPath);
+      await fs.copyFile(lbugPath, buildPath);
+    }
   } else {
     // Full rebuild path: wipe DB files first.
     // Set the dirty flag BEFORE the wipe whenever a prior meta exists,
@@ -1222,10 +1616,35 @@ export async function runFullAnalysis(
     // valve below can never drift. Failures now throw a typed LbugWipeError
     // (ENOENT-verified removal) instead of silently letting initLbug reopen
     // a still-populated DB this run believes it wiped.
-    await wipeLbugDbFiles(lbugPath);
+    //
+    // With the atomic swap (POSIX), this wipes the TEMP build target
+    // (`buildPath` = `<lbugPath>.new`, clearing any stragglers from a crashed
+    // run) and leaves the live index untouched until the end-of-run swap. On
+    // Windows buildPath === lbugPath, so this is the original in-place wipe.
+    await wipeLbugDbFiles(buildPath);
   }
 
-  await initLbug(lbugPath);
+  // Size the buffer pool to the graph just built by the pipeline (a page cache
+  // over the on-disk index, which scales with node/edge count) instead of the
+  // fixed 2 GiB default, whose eager commit dominates large-repo analyze. The
+  // size is clamped to [COPY-safety floor, default], so it only ever shrinks
+  // the pool; env override / no-hint paths are unchanged. See
+  // resolveBufferManagerSize / estimateBufferPool.
+  setBufferPoolSizeHint(
+    estimateBufferPool(
+      pipelineResult.graph.nodeCount +
+        pipelineResult.graph.relationshipCount +
+        // Streamed edges left the heap but still get COPYed, so they are part of
+        // the real load volume (#2680). The hint only ever SHRINKS the pool, so
+        // omitting them would starve the COPY at exactly the scale streaming
+        // exists to serve.
+        (pipelineResult.graphEmitManifest?.totalRows ?? 0),
+    ),
+  );
+
+  // Full rebuild (POSIX) builds into the temp `buildPath`; incremental and
+  // Windows use `buildPath === lbugPath` in place.
+  await initLbug(buildPath);
 
   // Manual WAL checkpoint driver (#1741): periodically drain the WAL
   // from JS so the un-retriable native auto-checkpoint almost never
@@ -1399,6 +1818,37 @@ export async function runFullAnalysis(
       //    and extractChangedSubgraph — asymmetry between the two would
       //    leave stale rows or PK-conflict at COPY time.
       const effectiveWriteSet = computeEffectiveWriteSet(pipelineResult.graph, writableFiles);
+
+      // `frameworkAnnotations` is derived from cross-file JVM visibility, so
+      // an unchanged Class row can change when a same-package declaration is
+      // added or removed without producing an IMPORTS edge. Compare the fresh
+      // graph against the pre-write DB and rewrite only files whose persisted
+      // value drifted. Add them after edge-boundary expansion: relationships
+      // touching these files are already included by extractChangedSubgraph,
+      // while pulling every unchanged neighbor would add no correctness.
+      // Only supported Spring Bean source changes can alter this property;
+      // avoid materializing every persisted Class row for unrelated language
+      // updates. Check deleted paths too so removing/renaming a Java shadowing
+      // declaration still refreshes unchanged Spring candidates.
+      const beanSourceChanged =
+        hashDiff.toWrite.some(isSpringBeanCandidateSourceFile) ||
+        hashDiff.deleted.some(isSpringBeanCandidateSourceFile);
+      if (beanSourceChanged) {
+        const persistedFrameworkAnnotations = (await executeQuery(
+          'MATCH (c:Class) ' + 'RETURN c.id AS id, c.frameworkAnnotations AS frameworkAnnotations',
+        )) as PersistedFrameworkAnnotationRow[];
+        const frameworkAnnotationDriftFiles = collectFrameworkAnnotationDriftFiles(
+          pipelineResult.graph,
+          persistedFrameworkAnnotations,
+        );
+        for (const filePath of frameworkAnnotationDriftFiles) effectiveWriteSet.add(filePath);
+        if (frameworkAnnotationDriftFiles.size > 0) {
+          log(
+            `Incremental: +${frameworkAnnotationDriftFiles.size} file(s) added for ` +
+              'framework annotation property drift',
+          );
+        }
+      }
       // Deduped: deleted entries may already appear via importer-BFS
       // expansion (the importer BFS can return a now-deleted path), which
       // would otherwise hand deleteNodesForFiles the same path twice in one
@@ -1420,7 +1870,44 @@ export async function runFullAnalysis(
       // DB write plan changes here; fileHashes/meta bookkeeping is identical.
       // Thresholds + the AND-gate live in incremental/escalation-gate.ts.
       const writeFraction = effectiveWriteSet.size / Math.max(1, allFilePaths.length);
+      // VECTOR gate (#2623) — load the extension BEFORE a single embedding row
+      // is touched. `deleteNodesForFiles` below opens with the CodeEmbedding
+      // join-delete, and LadybugDB refuses all DML on a table carrying its HNSW
+      // index unless VECTOR is loaded on this connection; nothing else on this
+      // path loads it until Phase 4, so every incremental run over a DB that
+      // already built `code_embedding_idx` died here. Same seam the FTS drop
+      // occupies at the head of this branch (#2589): index lifecycle first,
+      // then rows. UNCONDITIONAL — not gated on `shouldGenerateEmbeddings` —
+      // because a DB carrying the index from an earlier `--embeddings` run hits
+      // the identical wall on a plain incremental run.
+      //
+      // When VECTOR genuinely cannot load, the table is immutable (the index
+      // cannot be dropped without the extension either), so surgery is
+      // impossible: fall through to the escalation valve's wipe-and-COPY plan,
+      // which rebuilds the DB files outright and needs no embedding-row DML.
+      const embeddingRowDmlSafe = await ensureEmbeddingRowDmlSafe();
+      if (!embeddingRowDmlSafe && cachedEmbeddings.length === 0) {
+        // The escalation below WIPES the DB files, and Phase 3.5 restores
+        // embedding rows from `cachedEmbeddings` — which is only populated when
+        // `deriveEmbeddingMode` saw `meta.stats.embeddings > 0`. A DB whose meta
+        // under-reports its embeddings (meta restored from an older run, or a
+        // count that never got stamped) would therefore have every vector
+        // silently destroyed by a rebuild it did not ask for. Read them now,
+        // while the DB is still intact — a plain MATCH, which needs no VECTOR
+        // extension. Rows whose owning node is gone are dropped by Phase 3.5's
+        // live-graph filter, exactly as on any other wiped path.
+        const rescued = await loadCachedEmbeddings();
+        if (rescued.embeddings.length > 0) {
+          cachedEmbeddings = rescued.embeddings;
+          cachedEmbeddingNodeIds = rescued.embeddingNodeIds;
+          log(
+            `Preserving ${rescued.embeddings.length} embedding row(s) across the forced rebuild ` +
+              `(the index metadata did not account for them).`,
+          );
+        }
+      }
       if (
+        !embeddingRowDmlSafe ||
         shouldEscalateIncrementalWrite(
           filesToDelete.length,
           effectiveWriteSet.size,
@@ -1429,13 +1916,20 @@ export async function runFullAnalysis(
       ) {
         escalatedFullWrite = true;
         log(
-          `Incremental: effective write set covers ${effectiveWriteSet.size}/${allFilePaths.length} ` +
-            // Display clamp only (predicate unchanged): BFS-found deleted
-            // importers can push the numerator past the CURRENT file list, so
-            // the raw fraction can exceed 1 — see the population-mismatch note
-            // on shouldEscalateIncrementalWrite (tri-review 4669518496).
-            `files (${Math.min(100, Math.round(writeFraction * 100))}%) — switching to a full DB write ` +
-            `(wipe + bulk COPY) for this run; file-level incremental bookkeeping is unaffected.`,
+          !embeddingRowDmlSafe
+            ? `Incremental: the ${EMBEDDING_TABLE_NAME} vector index exists but the VECTOR ` +
+                `extension could not be loaded, so embedding rows cannot be rewritten in place — ` +
+                `switching to a full DB write (wipe + bulk COPY) for this run. Semantic search ` +
+                `falls back to exact scan until VECTOR is available; run \`gitnexus doctor\` for ` +
+                `live extension status, or set GITNEXUS_LBUG_EXTENSION_INSTALL=auto to allow one ` +
+                `bounded install attempt.`
+            : `Incremental: effective write set covers ${effectiveWriteSet.size}/${allFilePaths.length} ` +
+                // Display clamp only (predicate unchanged): BFS-found deleted
+                // importers can push the numerator past the CURRENT file list, so
+                // the raw fraction can exceed 1 — see the population-mismatch note
+                // on shouldEscalateIncrementalWrite (tri-review 4669518496).
+                `files (${Math.min(100, Math.round(writeFraction * 100))}%) — switching to a full DB write ` +
+                `(wipe + bulk COPY) for this run; file-level incremental bookkeeping is unaffected.`,
         );
         // toWriteCount: 0 is the established full-path dirty-flag sentinel;
         // the real counters ride along for crash diagnostics.
@@ -1456,8 +1950,8 @@ export async function runFullAnalysis(
         // to replace wholesale.
         await walCheckpointDriver.stop();
         await closeLbug();
-        await wipeLbugDbFiles(lbugPath);
-        await initLbug(lbugPath);
+        await wipeLbugDbFiles(buildPath);
+        await initLbug(buildPath);
         walCheckpointDriver = startWalCheckpointDriver();
         await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
           lbugMsgCount++;
@@ -1465,7 +1959,20 @@ export async function runFullAnalysis(
           progress('lbug', pct, msg);
         });
       } else {
-        // 1a. Remove the write set's existing rows — batched (#2409): one
+        // 1a. Drop every FTS index before touching a single row (#2589).
+        //     `deleteNodesForFiles` below DETACH DELETEs rows out of tables
+        //     that otherwise still carry the FTS index built at the end of
+        //     the PREVIOUS analyze run — Phase 3 doesn't drop+rebuild it
+        //     until well after this delete completes. LadybugDB's FTS
+        //     extension is not proven to survive DML against an indexed
+        //     table (its own docs never demonstrate it), and that ordering
+        //     is exactly what produced "FTS index 'file_fts' is
+        //     inconsistent: term is missing during delete". Dropping first
+        //     removes the hazard outright; Phase 3's createSearchFTSIndexes
+        //     rebuilds every index from the final row set regardless, so
+        //     this is a no-op on its own drop step there.
+        await dropSearchFTSIndexes();
+        // 1b. Remove the write set's existing rows — batched (#2409): one
         //     DETACH DELETE per table per 200-file chunk. The former per-file
         //     loop issued a count + delete per table per FILE — ~13k
         //     single-row write transactions on a ~700-file write set — which
@@ -1559,6 +2066,7 @@ export async function runFullAnalysis(
           progress('lbug', pct, msg);
         },
         pipelineResult.pdgEmitManifest,
+        pipelineResult.graphEmitManifest,
       );
     }
 
@@ -1577,8 +2085,22 @@ export async function runFullAnalysis(
     const ftsAvailable = await loadFTSExtension(undefined, {
       policy: resolveAnalyzeInstallPolicy(),
     });
+    // Tracks whether search indexes actually ended up usable this run — starts
+    // as ftsAvailable (extension loaded) but flips to false below when the
+    // build/verify step itself fails, so capabilities.fts.status / ftsSkipped
+    // stay honest even though that failure no longer aborts the whole analyze.
+    let ftsReady = ftsAvailable;
+    // Why FTS ended up skipped (#2658 review L2): extension-unavailable up front,
+    // or build-failed in the degrade branch below.
+    let ftsSkipReason: 'extension-unavailable' | 'build-failed' | undefined = ftsAvailable
+      ? undefined
+      : 'extension-unavailable';
     if (ftsAvailable) {
-      await createSearchFTSIndexes({
+      // Degrade rather than throw: createSearchFTSIndexes re-tokenizes every
+      // stored row on every run, so a native tokenizer error on a single
+      // pre-existing row (#2544/#2546) must not discard this run's otherwise-
+      // successful graph/embeddings work — only keyword search degrades.
+      const ftsResult = await buildSearchIndexesOrDegrade(executeQuery, {
         onIndexStart: options.verbose
           ? (table, indexName) => log(`FTS: creating ${table}.${indexName}`)
           : undefined,
@@ -1586,14 +2108,32 @@ export async function runFullAnalysis(
           ? (table, indexName) => log(`FTS: ready ${table}.${indexName}`)
           : undefined,
       });
-      const missingIndexNames = await verifySearchFTSIndexes(executeQuery);
-      if (missingIndexNames.length > 0) {
+      if (ftsResult.ok) {
+        progress('fts', 90, 'Search indexes ready');
+      } else if (ftsFailureIsFatal(ftsResult.failureClass, useAtomicSwap)) {
+        // #2658: an IO/rename/checkpoint/corruption failure while building FTS
+        // is a genuinely broken build on this disk — not a concurrent writer
+        // (the single-writer lock rules that out). ONLY fatal on the atomic-swap
+        // path: the graph was built into a throwaway staging DB, so throwing
+        // before the swap abandons the staging file and leaves the previous live
+        // index intact. On an in-place build the live DB is already mutated and
+        // cannot be rolled back by throwing (see ftsFailureIsFatal) — those
+        // degrade in the branch below instead.
         throw new Error(
-          `FTS verification failed - missing indexes after analyze: ${missingIndexNames.join(', ')}. ` +
-            'Check FTS extension availability, then retry `gitnexus analyze --force` for a full rebuild.',
+          `Search index build failed with an integrity error and the analysis was aborted ` +
+            `to avoid publishing a broken index: ${ftsResult.error}. The previous index is ` +
+            `left intact. Re-run \`gitnexus analyze\`; if it persists, check the disk for space ` +
+            `or corruption.`,
         );
+      } else {
+        ftsReady = false;
+        ftsSkipReason = 'build-failed';
+        log(
+          `FTS index build failed (${ftsResult.error}) — keyword search degraded this run. ` +
+            'Graph and embeddings analysis completed successfully. Run `gitnexus analyze --repair-fts` to retry.',
+        );
+        progress('fts', 90, 'Search indexes skipped (build failed)');
       }
-      progress('fts', 90, 'Search indexes ready');
     } else {
       // For a missing runtime dependency (#2374) the file is present, so the
       // generic "install it with network access" tail in FTS_UNAVAILABLE_MESSAGE
@@ -1735,7 +2275,7 @@ export async function runFullAnalysis(
     if (shouldGenerateEmbeddings) {
       const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
         stats.nodes,
-        options.embeddingsNodeLimit,
+        resumeEmbeddingCheckpoint ? 0 : options.embeddingsNodeLimit,
       );
       if (!skipForCap) {
         embeddingSkipped = false;
@@ -1777,8 +2317,8 @@ export async function runFullAnalysis(
     //     the case a naive gate would leave index-less again.
     // buildVectorIndex carries its own extension-policy gate and
     // warn-on-failure; the boolean feeds semanticMode so the finalize stamp
-    // reflects the DB's ACTUAL state even when recreation fails (win32 /
-    // extension unavailable → 'exact-scan').
+    // reflects the DB's ACTUAL state even when recreation fails (extension
+    // unavailable → 'exact-scan').
     const dbWasWiped = !isIncremental || escalatedFullWrite;
     if (restoredEmbeddingCount > 0 && dbWasWiped && embeddingSkipped) {
       // Re-import at the seam rather than thread a mutable capture from
@@ -1801,6 +2341,11 @@ export async function runFullAnalysis(
         httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...',
       );
       const { runEmbeddingPipeline } = await import('./embeddings/embedding-pipeline.js');
+      if (!embeddingIdentityForRun) {
+        const { resolveEmbeddingIdentity } = await import('./embeddings/embedding-identity.js');
+        embeddingIdentityForRun = resolveEmbeddingIdentity();
+      }
+      const embeddingIdentity = embeddingIdentityForRun;
       // Build a Map<nodeId, contentHash> from cached embeddings for incremental mode
       let existingEmbeddings: Map<string, string> | undefined;
       if (cachedEmbeddingNodeIds.size > 0) {
@@ -1809,6 +2354,51 @@ export async function runFullAnalysis(
           existingEmbeddings.set(e.nodeId, e.contentHash ?? STALE_HASH_SENTINEL);
         }
       }
+
+      const saveEmbeddingCheckpoint = async (
+        checkpoint: {
+          nodesProcessed: number;
+          totalNodes: number;
+          chunksProcessed: number;
+        },
+        pendingNodeIds: string[],
+        embeddings: number | undefined,
+      ): Promise<void> => {
+        const fileHashes: Record<string, string> = {};
+        for (const [key, value] of newFileHashes) fileHashes[key] = value;
+        await saveMeta(metaDir, {
+          ...(existingMeta ?? {}),
+          repoPath,
+          lastCommit: currentCommit,
+          indexedAt: new Date().toISOString(),
+          runnerIdentity,
+          branch: branchLabel ?? existingMeta?.branch,
+          remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+          stats: {
+            files: pipelineResult.totalFileCount,
+            nodes: stats.nodes,
+            edges: stats.edges,
+            communities: pipelineResult.communityResult?.stats.totalCommunities,
+            processes: pipelineResult.processResult?.stats.totalProcesses,
+            embeddings,
+          },
+          schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
+          analysisFeatures: currentAnalysisFeatures,
+          cjkSegmentation: getSearchFTSCjkSegmentation(),
+          fileHashes: hasGitDir(repoPath) ? fileHashes : undefined,
+          cacheKeys: [...parseCache.usedKeys],
+          incrementalInProgress: undefined,
+          embeddingCheckpoint: {
+            at: new Date().toISOString(),
+            ...checkpoint,
+            model: embeddingIdentity.model,
+            dimensions: embeddingIdentity.dimensions,
+            provider: embeddingIdentity.provider,
+            pendingNodeIds,
+          },
+          pdg: resolvePdgConfig(options),
+        });
+      };
 
       const embeddingResult = await runEmbeddingPipeline(
         executeQuery,
@@ -1826,6 +2416,21 @@ export async function runFullAnalysis(
         {},
         cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
         existingEmbeddings,
+        {
+          forceReembedNodeIds: pendingEmbeddingNodeIds,
+          onCheckpointWindowStart: async ({ nodeIds, ...checkpoint }) => {
+            await saveEmbeddingCheckpoint(checkpoint, nodeIds, existingMeta?.stats?.embeddings);
+          },
+          onCheckpoint: async (checkpoint) => {
+            await checkpointOnce();
+            const countResult = await executeQuery(
+              `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
+            );
+            const countRow = countResult?.[0];
+            const embeddings = Number(countRow?.cnt ?? countRow?.[0] ?? 0);
+            await saveEmbeddingCheckpoint(checkpoint, [], embeddings);
+          },
+        },
       );
       if (embeddingResult.semanticMode === 'exact-scan') {
         semanticMode = 'exact-scan';
@@ -1896,6 +2501,7 @@ export async function runFullAnalysis(
       repoPath,
       lastCommit: currentCommit,
       indexedAt: new Date().toISOString(),
+      runnerIdentity,
       // Branch identity this index represents (#2106). Recorded for the flat
       // slot too (so resolveBranchPlacement knows which branch owns it). When
       // the label is null (detached HEAD / non-git re-analyze) we PRESERVE an
@@ -1927,7 +2533,7 @@ export async function runFullAnalysis(
         // meta.json / `gitnexus doctor` honest about degraded search.
         fts: {
           provider: 'ladybugdb-fts',
-          status: ftsAvailable ? runtimeCapabilities.fts : 'unavailable',
+          status: ftsReady ? runtimeCapabilities.fts : 'unavailable',
         },
         vectorSearch: {
           provider: effectiveSemanticMode === 'vector-index' ? 'ladybugdb-vector' : 'exact-scan',
@@ -1941,6 +2547,7 @@ export async function runFullAnalysis(
       // incrementalInProgress to undefined explicitly clears any prior
       // dirty flag (full and incremental success paths converge here).
       schemaVersion: hasGitDir(repoPath) ? INCREMENTAL_SCHEMA_VERSION : undefined,
+      analysisFeatures: currentAnalysisFeatures,
       // Always stamped with the live resolved mode (#2331/#2339) — unlike
       // `pdg` below, 'none' is a meaningful value to compare, not an
       // absence, so this is never conditionally omitted.
@@ -1952,6 +2559,7 @@ export async function runFullAnalysis(
       // so a sibling branch's prune can union it and not evict our shards.
       cacheKeys: [...parseCache.usedKeys],
       incrementalInProgress: undefined as RepoMeta['incrementalInProgress'],
+      embeddingCheckpoint: undefined,
       // The effective pdg config this run's DB rows were built under
       // (#2099 F1). `undefined` on pdg-off runs — this meta is a fresh
       // literal (no spread of existingMeta), so omission is what CLEARS the
@@ -1959,7 +2567,18 @@ export async function runFullAnalysis(
       // off==off and incremental eligibility is restored.
       pdg: resolvePdgConfig(options),
     };
-    await saveMeta(metaDir, meta);
+    // Re-resolve at the commit boundary. Long analyses can overlap an npm
+    // upgrade, rebuilt dist tree, or native dependency replacement; stamping
+    // the start-of-run receipt after such a mutation would falsely certify a
+    // graph produced by two analyzer identities. Stable-read validation lives
+    // inside the resolver, and a mismatch leaves the dirty flag intact so the
+    // next run takes the established full-recovery path.
+    meta.runnerIdentity = finalizeAnalyzerRunnerIdentity(import.meta.url, runnerIdentity);
+    // #2614 F1: the freshness stamp (saveMeta) is written AFTER the atomic swap
+    // below — never here — so a concurrent MCP reader can't observe
+    // meta.indexedAt = T_new while lbugPath still resolves to the pre-swap
+    // inode (which latched the reader on the stale index permanently). The meta
+    // object is fully computed at this point; only its write is deferred.
 
     // Persist the incremental parse cache for the next run. Wraps in
     // try/catch so a cache-write failure never breaks an otherwise
@@ -2097,7 +2716,59 @@ export async function runFullAnalysis(
     // LadybugDB destructor double-free after --pdg writes — closeLbugBeforeExit
     // CHECKPOINTs for durability then leaves the handles for process exit to
     // reclaim (#2264). Long-lived callers close for real.
-    await (options.skipNativeCloseOnExit ? closeLbugBeforeExit() : closeLbug());
+    //
+    // On Windows a swap must release the build handle before the rename (a
+    // same-process open file can't be renamed), so it forces a real close —
+    // safe because windowsSwapOk excludes --pdg (the #2264 case). POSIX renames
+    // an open file, so it keeps the skip-native-close there.
+    const forceRealCloseForSwap = useAtomicSwap && process.platform === 'win32';
+    await (options.skipNativeCloseOnExit && !forceRealCloseForSwap
+      ? closeLbugBeforeExit()
+      : closeLbug());
+
+    // #2 atomic publish: the fresh index was built at buildPath (a full rebuild,
+    // or an opt-in atomic incremental that copied the live index in first). Swap
+    // it over the live lbugPath in one rename so an MCP reader that opened
+    // mid-build only ever saw the previous complete index — never a wiped/
+    // half-built file. The close above checkpoint-consolidated buildPath to a
+    // single file (no .wal), so the rename publishes a complete index; a reader
+    // holding the old inode keeps a consistent stale snapshot until the pool
+    // re-opens onto the new one (the pool staleness invalidation). Runs only on
+    // success — a thrown error skips this, leaving the live index intact and the
+    // temp build to be cleared by the next run's wipe.
+    // Only publish if the build actually produced a DB at buildPath. A
+    // degenerate run (empty repo, or a mocked pipeline that never opened the
+    // store) leaves nothing to swap — skip rather than throw ENOENT.
+    const builtDbExists = useAtomicSwap
+      ? await fs.stat(buildPath).then(
+          () => true,
+          () => false,
+        )
+      : false;
+    if (useAtomicSwap && builtDbExists) {
+      await retryRename(buildPath, lbugPath);
+      // Clear any sidecars orphaned beside the replaced file. A cleanly-closed
+      // prior index has none; a crashed one could, and it would be replay
+      // poison next to the freshly published index. Best-effort.
+      for (const suffix of ['.wal', '.shadow', '.wal.checkpoint'] as const) {
+        await fs.rm(`${lbugPath}${suffix}`, { force: true }).catch(() => {});
+      }
+      // #2614 F4: if the final checkpoint silently failed, the build may still
+      // carry a residual .wal/.shadow under the temp name. MOVE it beside the
+      // published index (not orphan/delete it) so the next open replays the
+      // delta, rather than leaving it under a name LadybugDB never reconciles.
+      for (const suffix of ['.wal', '.shadow'] as const) {
+        await fs.rename(`${buildPath}${suffix}`, `${lbugPath}${suffix}`).catch(() => {});
+      }
+    }
+
+    // #2614 F1: stamp the freshness metadata now that the index is published.
+    // When meta.indexedAt becomes visible, lbugPath already resolves to the new
+    // inode, so a reader reiniting on the stamp opens the fresh graph rather
+    // than latching on the old one. Leaving the dirty flag set across the swap
+    // is a crash-safety improvement: a failed swap leaves the previous index
+    // live and the next run recovers via the full-rebuild path.
+    await saveMeta(metaDir, meta);
 
     progress('done', 100, 'Done');
 
@@ -2106,7 +2777,8 @@ export async function runFullAnalysis(
       repoPath,
       stats: meta.stats,
       pipelineResult,
-      ftsSkipped: !ftsAvailable,
+      ftsSkipped: !ftsReady,
+      ftsSkipReason: ftsReady ? undefined : ftsSkipReason,
       isPrimaryBranch: !placement.branch,
     };
   } catch (err) {

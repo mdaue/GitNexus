@@ -1,7 +1,7 @@
-<!-- version: 1.7.0 -->
-<!-- Last updated: 2026-04-23 -->
+<!-- version: 1.14.0 -->
+<!-- Last updated: 2026-07-16 -->
 
-Last reviewed: 2026-04-23
+Last reviewed: 2026-07-16
 
 **Project:** GitNexus · **Environment:** dev · **Maintainer:** repository maintainers (see GitHub)
 
@@ -41,7 +41,7 @@ Commands and gotchas live under **Repo reference** below and in **[CONTRIBUTING.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)**, **[CONTRIBUTING.md](CONTRIBUTING.md)**, **[GUARDRAILS.md](GUARDRAILS.md)**
 - **Call & inheritance resolution (RFC #909 Ring 3):** See ARCHITECTURE.md § Scope-Resolution Pipeline. All languages resolve calls and inheritance through the scope-resolution pipeline (`Registry.lookup`, `preEmitInheritanceEdges`, `emitHeritageEdges`, `buildMro` → `MethodDispatchIndex`). **Shared code in `gitnexus/src/core/ingestion/` must not name languages** — plug language behavior in via `LanguageProvider` / `ScopeResolver` hooks. A language plugs in by implementing `ScopeResolver` (`scope-resolution/contract/scope-resolver.ts`) and registering it in `SCOPE_RESOLVERS`. (The legacy call-resolution DAG + `@heritage` capture path were removed in RING4-1 #942.)
 - **Cursor:** `.cursor/index.mdc` (always-on); `.cursor/rules/*.mdc` (glob-scoped). Legacy `.cursorrules` deprecated.
-- **GitNexus:** skills in `.claude/skills/gitnexus/`; MCP rules in `gitnexus:start` block below.
+- **GitNexus:** standard skills in `.claude/skills/gitnexus-*/`; MCP rules in `gitnexus:start` block below.
 
 ## PR Swarm Review (cross-CLI)
 
@@ -54,6 +54,37 @@ Cursor, Copilot, or any agent reading this file). Per-CLI entrypoints are thin w
 listed in [`pr-swarm-review/README.md`](pr-swarm-review/README.md); edit review logic only
 in the canonical files, never in the wrappers. The review is read-only — it never edits,
 commits, or posts.
+
+## Engineering planning & execution (`/gitnexus-plan` · `/gitnexus-work` · `/gitnexus-review` · `/gitnexus-lfg`)
+
+Four canonical, CLI-neutral skill specs under `.claude/skills/` (Claude Code invokes
+them as slash commands; Codex or any other agent reading this file should read the
+named SKILL.md and follow it directly — user-level Codex prompts are documented in the
+plan/work/lfg skill READMEs):
+
+- **`gitnexus-plan/SKILL.md`** — deep, implementation-ready plan for a code change:
+  GitNexus graph intelligence for navigation, statement-level PDG slices for behavioral
+  constraints, targeted source reads for verification. Output lands in `docs/plans/`
+  with a reusable implementation context pack (section 11). Planning-only — it never
+  edits code (index freshness refreshes via `analyze --index-only` are the one
+  permitted state change). Interactive runs ask up front how deep to go
+  (quick / standard / deep); Deepen mode strengthens an existing plan in place.
+- **`gitnexus-work/SKILL.md`** — executes a gitnexus-plan as verified atomic commits:
+  drift-checks the plan's evidence pin against HEAD, `impact` before every symbol
+  edit, tests from the plan's scenarios, `detect_changes` before every commit.
+- **`gitnexus-review/SKILL.md`** — read-only GitNexus review of a PR URL/number,
+  branch or commit range, or local staged/unstaged/untracked changes. It pins exact
+  SHAs, aligns the graph and checkout, runs a PDG-backed taint pass on trust-boundary
+  diffs, scales to per-domain expert lenses from the graph's clusters (dispatched as
+  parallel swarm lanes — `ci-personas/` — when the CI review agent runs it), and
+  reports evidence-backed findings.
+- **`gitnexus-lfg/SKILL.md`** — pipeline orchestrator: plan (depth asked up front) →
+  blocking user gate (proceed or stop) → work → `gitnexus-review`.
+
+The family ships with the npm package (`gitnexus/skills/`, installed to editor targets
+by `gitnexus setup`) and the Claude Code plugin; review also has a standalone Cursor
+mirror. `gitnexus/test/unit/shipped-skills-sync.test.ts` guards the copies. Token savings of the workflow are measurable with
+`eval/workflow_bench/` (real headless CLI runs, free-model routing supported — see its README).
 
 ## Changelog
 
@@ -75,14 +106,14 @@ commits, or posts.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **GitNexus** (26675 symbols, 35395 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **GitNexus** (20319 symbols, 54304 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze --embeddings --pdg` from the project root — it auto-selects an available runner. Add `--embeddings` for semantic search and `--pdg` for taint/control-flow analysis. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
 ## Always Do
 
 - **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
 - **MUST use GitNexus `query({search_query: "..."})` for codebase search.** Use hybrid BM25 + semantic vector search (RRF) via `query` instead of filesystem search tools (`grep`, `ripgrep`, `find`).
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.

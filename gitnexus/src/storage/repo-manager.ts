@@ -82,10 +82,75 @@ export const canonicalizePath = (p: string): string => {
 export const registryPathEquals = (a: string, b: string): boolean =>
   process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 
+/**
+ * Does the clone dir derived from an entry's *name* actually belong to that
+ * entry? Registry names are not unique across storage locations: a cloned
+ * repo under `~/.gitnexus/repos/<name>` and a local repo registered under the
+ * same name share a `getCloneDir(entry.name)` result. The server's delete
+ * handler must therefore never remove the clone dir based on the name alone —
+ * only when the entry's own `path` resolves to that dir (mirroring its step-2b
+ * rule that cleanup is driven off `entry.path`, so a same-named sibling's
+ * clone is never removed). Both sides are canonicalised so symlinked or
+ * differently-spelled forms of the same dir still match.
+ */
+export const cloneDirBelongsToEntry = (cloneDir: string, entryPath: string): boolean =>
+  registryPathEquals(canonicalizePath(cloneDir), canonicalizePath(entryPath));
+
+/**
+ * Versioned receipt for the analyzer process that produced an index.
+ *
+ * Paths identify the resolved runtime and invoked GitNexus entry artifact on
+ * this machine. The entry artifact is diagnostic (CLI and server-worker entry
+ * files differ); semantic freshness compares the runtime/build/dependency
+ * fields. SHA-256 digests make the receipt independently reproducible:
+ * `invokedArtifact.digest` covers the entry file, `build.digest` covers the
+ * complete source or distribution tree, and `dependencyRuntime.digest` covers
+ * the applicable lockfile, resolved runtime package metadata, and every
+ * content-addressed package payload (including JS/JSON/native/Wasm inputs)
+ * using the canonicalizations defined in `core/analyzer-identity.ts`.
+ */
+export interface AnalyzerRunnerIdentity {
+  schemaVersion: 4;
+  runtime: {
+    executablePath: string;
+    version: string;
+    platform: string;
+    architecture: string;
+    modulesAbi: string;
+    libc: string;
+  };
+  cliVersion: string;
+  invokedArtifact: {
+    path: string;
+    digest: string;
+  };
+  build: {
+    kind: 'source' | 'distribution';
+    rootPath: string;
+    canonicalization: 'gitnexus-analyzer-build-v2';
+    digest: string;
+  };
+  dependencyRuntime: {
+    manifestPath: string;
+    lockfilePath: string | null;
+    canonicalization: 'gitnexus-analyzer-dependency-runtime-v4';
+    packageCount: number;
+    artifactCount: number;
+    digest: string;
+  };
+}
+
 export interface RepoMeta {
   repoPath: string;
   lastCommit: string;
   indexedAt: string;
+  /**
+   * Analyzer/runtime receipt for the successful run represented by this
+   * metadata. Optional so indexes written by older GitNexus releases remain
+   * readable; a missing value means provenance is unknown, never that it
+   * matches the currently invoked analyzer.
+   */
+  runnerIdentity?: AnalyzerRunnerIdentity;
   /**
    * Canonical `origin` remote URL captured at index time. Used to
    * fingerprint the same logical repo across multiple on-disk clones
@@ -130,6 +195,12 @@ export interface RepoMeta {
    * full rebuild rather than risk an inconsistent incremental update.
    */
   schemaVersion?: number;
+  /**
+   * Exact versions of independently-gated analysis capabilities produced by
+   * the successful run. Unlike schemaVersion, these may apply only to repos
+   * containing relevant source files.
+   */
+  analysisFeatures?: Record<string, number>;
   /**
    * The resolved GITNEXUS_FTS_CJK_SEGMENTATION mode ('none' | 'bigram') the
    * existing index's content/description columns were last written under
@@ -182,6 +253,30 @@ export interface RepoMeta {
      *  diagnostics must show whether the write set was already
      *  under-expanded when the run died. */
     droppedImporterChunks?: number;
+  };
+  /**
+   * Durable embedding-resume marker. Before a bounded write window begins,
+   * `pendingNodeIds` records every node that could become partially persisted;
+   * after the LadybugDB checkpoint it is cleared while progress is retained.
+   * A matching runtime resumes from persisted hashes and regenerates pending
+   * nodes; a model or dimension mismatch fails before mutation.
+   */
+  embeddingCheckpoint?: {
+    at: string;
+    nodesProcessed: number;
+    totalNodes: number;
+    chunksProcessed: number;
+    model: string;
+    dimensions: number;
+    /** `local` or a secret-free SHA-256 fingerprint of the HTTP endpoint identity. */
+    provider: string;
+    /**
+     * Nodes in the current checkpoint window. Any of these may have only a
+     * subset of their chunks persisted after an abrupt process termination,
+     * so resume must delete and regenerate them even when a persisted row has
+     * the current content hash.
+     */
+    pendingNodeIds?: string[];
   };
   /**
    * Name of the git branch this index represents (#2106). Absent for the
@@ -317,8 +412,63 @@ export interface RepoMeta {
  * writeback preserves unchanged-file rows, so a top-up against a pre-v6 index
  * would MIX old 1-based rows with new 0-based ones — and the 1-based MCP display
  * would render the stale rows one line too high — so force a full re-analyze.
+ * v7: callable-value-flow CALLS/USES edges added (#2437/#2522) — new edges can
+ * connect two files whose content did not change, but the incremental write set
+ * only covers changed files (`computeEffectiveWriteSet`), so a top-up against a
+ * pre-v7 index would silently omit the new edges for every unchanged file pair;
+ * force a full re-analyze instead (same contract as v2–v6).
+ * v8: Java anonymous class bodies became first-class Class nodes (#2550):
+ * `new Runnable() { run(){} }` now emits `Class:...:Worker$1` and its methods
+ * re-keyed from `Worker.run` to `Worker$1.run`. Node identities move on
+ * unchanged files — a top-up against a pre-v8 index would strand the old
+ * `Worker.run`-keyed Method nodes alongside the new ones (the v5 Route
+ * precedent); force a full re-analyze instead.
+ * v9: Java enum constant bodies joined the instance model and anonymous
+ * naming switched to JLS 13.1 immediately-enclosing-type chains (#2555): `enum E { A {
+ * hook(){} } }` now emits `Class:...:E$1` with methods re-keyed from
+ * `E.hook` to `E$1.hook`, and nested-host anonymous names re-key
+ * (`EnumWrap$1` → `EnumWrap$Mode$1`). Same contract as v8: identities move
+ * on unchanged files; force a full re-analyze.
+ * v10: Java `record_declaration` now emits a first-class `Record` graph node
+ * (#2564): a record's container node was previously never created (JAVA_QUERIES
+ * had no capture for it), so its methods existed as ownerless Method nodes
+ * with no `HAS_METHOD` edge. The incremental write set only covers changed
+ * files — a top-up against a pre-v10 index would keep silently omitting the
+ * `Record` node and its `HAS_METHOD` edges for every unchanged record file
+ * (same v7 contract: new nodes/edges the incremental path would otherwise
+ * never backfill); force a full re-analyze instead.
+ * v11: Rust abstract trait methods (`fn foo(&self) -> T;`, no body) now get a
+ * scope + declaration capture (#2604): RUST_SCOPE_QUERY had no
+ * `function_signature_item` pattern, so a `&dyn Trait` receiver could never
+ * dispatch a CALLS edge to the trait's own method. Same v7/v10 contract: the
+ * incremental write set only covers changed files, so a top-up against a
+ * pre-v11 index would keep silently missing these CALLS edges for every
+ * unchanged Rust trait file; force a full re-analyze instead.
+ * v12: Rust range-binding stopped restoring ambiguous duplicate type names
+ * (#2514): a function/struct name defined three or more times used to
+ * re-resolve to the last-scanned file (a presence toggle), so odd duplicate
+ * counts emitted a wrong cross-file CALLS edge. Same v7/v11 contract: the
+ * incremental write set only covers changed files, so a top-up against a
+ * pre-v12 index would keep these spurious CALLS edges on every unchanged Rust
+ * file. v12 also changes edges in the other direction: range-binding now
+ * RESOLVES import-disambiguated duplicate names (`for item in make()` /
+ * `let Struct { f } = ..` where a `use` or `use x::*` import pins one of several
+ * same-named definitions) to the imported definition's type. Both the removed
+ * spurious edges and these new resolved edges are cross-file, so a pre-v12
+ * top-up would leave unchanged Rust files stale either way; force a full
+ * re-analyze instead.
+ * v13: Java local classes, enums, records, and interfaces use
+ * source-type-relative JLS 13.1 identities (`Outer$1Local`). Number allocation
+ * matches javac: one sequence per (enclosing type, local simple name), with a
+ * separate sequence for anonymous types. Existing type/member ids, lexical
+ * bindings, and ownership edges must not be mixed with newly named unchanged
+ * Java files; force a full re-analyze.
+ * v14: C# and Kotlin free-call fallback now rejects same-file methods whose
+ * instance owner is outside the caller's enclosing class/MRO (#2563). The
+ * incremental write set would otherwise retain those stale CALLS edges on
+ * every unchanged C# and Kotlin file; force a full re-analyze instead.
  */
-export const INCREMENTAL_SCHEMA_VERSION = 6;
+export const INCREMENTAL_SCHEMA_VERSION = 14;
 
 export interface IndexedRepo {
   repoPath: string;

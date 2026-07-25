@@ -12,7 +12,17 @@ import {
   type EmbeddingRuntimeResolution,
 } from '../core/embeddings/runtime-install.js';
 import { cudaRedirectDoctorStatus } from '../core/embeddings/onnxruntime-node-resolver.js';
-import { checkLbugNative, probeFtsExtensionLoad } from '../core/lbug/native-check.js';
+import {
+  checkLbugNative,
+  type NativeCheckResult,
+  probeFtsExtensionLoad,
+  probeVectorExtensionLoad,
+} from '../core/lbug/native-check.js';
+import {
+  getEffectiveBufferPoolSize,
+  getOsPageSize,
+  isPageSizeAwareLadybug,
+} from '../core/lbug/lbug-config.js';
 import { diagnoseExtensionLoad } from '../core/lbug/extension-load-error.js';
 import { getExtensionInstallPolicy } from '../core/lbug/extension-loader.js';
 import { t } from './i18n/index.js';
@@ -112,6 +122,82 @@ export function localEmbeddingDoctorStatus(opts: {
   return { status: '✓ local embeddings supported', detail: null };
 }
 
+/**
+ * Page-size lines for the `doctor` Runtime section (#1231). Pure so the
+ * warning gate can be unit-tested without running the whole command (the
+ * `localEmbeddingDoctorStatus` precedent above) — but takes the probed
+ * values as plain params rather than injectable probes, because `undefined`
+ * is a *meaningful* pageSize state here (probe unavailable / win32) and
+ * would collide with a "not provided → use default" DI convention.
+ *
+ * Returns 0 lines (page size unknown), 1 line (page size), or 2 lines
+ * (page size + non-4K warning when the installed @ladybugdb/core does not
+ * detect the OS page size at runtime).
+ */
+export function pageSizeDoctorLines(
+  pageSize: number | undefined,
+  ladybugVersion: string | undefined,
+): string[] {
+  if (pageSize === undefined) return [];
+  const lines = [`  ${padDisplayEnd('page size', 10)}${pageSize}`];
+  if (pageSize > 4096 && !isPageSizeAwareLadybug(ladybugVersion)) {
+    // Don't assert "< 0.18.0" as fact when the version is unresolvable
+    // (#2424 review R2) — name the unknown state instead.
+    const versionClause =
+      ladybugVersion === undefined
+        ? 'an unknown @ladybugdb/core version (may predate 0.18.0)'
+        : `@ladybugdb/core < 0.18.0`;
+    lines.push(
+      `  ${padDisplayEnd('', 10)}⚠ non-4K page size with ${versionClause} — ` +
+        `'gitnexus analyze' may fail during COPY (#1231). Upgrade gitnexus (npm install -g gitnexus@latest).`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * The hintless buffer-pool doctor line (#2631) — the pool the next Database
+ * open in THIS process would get. Same plain-params testable-helper shape as
+ * pageSizeDoctorLines above. `pool` is getEffectiveBufferPoolSize(): `0` is
+ * the pass-through sentinel for LadybugDB's native 80%-of-RAM default, never
+ * printed as "0 MiB". `envRaw` (the raw GITNEXUS_LBUG_BUFFER_POOL_SIZE value)
+ * marks operator-supplied absolute values as "(env override)" — no scaling
+ * suffix: the hintless default is deliberately unscaled (#2557), and an env
+ * value is absolute, so a "×N" note would misdescribe both.
+ */
+export function poolSizeDoctorLine(pool: number, envRaw: string | undefined): string {
+  const value = pool === 0 ? 'native 80% of RAM' : `${Math.round(pool / (1024 * 1024))} MiB`;
+  const envNote = envRaw !== undefined && envRaw.trim().length > 0 ? ' (env override)' : '';
+  return `  ${padDisplayEnd('pool size', 10)}${value}${envNote}`;
+}
+
+/**
+ * The `native` status line. Literal label like the page-size and pool-size lines
+ * above (no i18n key).
+ *
+ * A failed check is not automatically a MISSING binary, and saying so is the
+ * same misdiagnosis #2672 fixed one layer down: on a host whose glibc is too
+ * old, `lbugjs.node` is present and merely unloadable, so "missing" sent users
+ * to reinstall a file that was already there — while the detail written to
+ * stderr right below said the opposite. Render what the check actually found.
+ */
+export function nativeStatusLine(check: NativeCheckResult): string {
+  return `  ${padDisplayEnd('native', 10)}${nativeStatusText(check)}`;
+}
+
+function nativeStatusText(check: NativeCheckResult): string {
+  if (check.ok) return '✓ lbugjs.node loaded';
+  switch (check.kind) {
+    case 'package_missing':
+      return '✗ @ladybugdb/core not installed';
+    case 'load_failed':
+      return '✗ lbugjs.node present but failed to load';
+    default:
+      // 'binary_missing', and any future kind: the conservative claim.
+      return '✗ lbugjs.node missing';
+  }
+}
+
 export const doctorCommand = async () => {
   const fingerprint = getRuntimeFingerprint();
   const capabilities = getRuntimeCapabilities();
@@ -123,11 +209,21 @@ export const doctorCommand = async () => {
   console.log(`  ${label('doctor.labels.node', 10)}${fingerprint.node}`);
   console.log(`  ${label('doctor.labels.gitnexus', 10)}${fingerprint.gitnexus}`);
   console.log(`  ${label('doctor.labels.ladybugdb', 10)}${fingerprint.ladybugdb ?? 'unknown'}`);
+  // OS page size next to the LadybugDB version because the two interact:
+  // @ladybugdb/core < 0.18.0 assumed 4 KiB pages in its buffer manager and
+  // crashes mid-COPY on 16 KiB/64 KiB-page kernels (#1231). Literal label
+  // (like the 'native' line below) to avoid adding i18n keys.
+  for (const line of pageSizeDoctorLines(getOsPageSize(), fingerprint.ladybugdb)) {
+    console.log(line);
+  }
+  // Hintless buffer pool for the next DB open (#2631). Literal label like
+  // the page size line above (no i18n key).
+  console.log(
+    poolSizeDoctorLine(getEffectiveBufferPoolSize(), process.env.GITNEXUS_LBUG_BUFFER_POOL_SIZE),
+  );
   const nativeCheck = checkLbugNative();
-  if (nativeCheck.ok) {
-    console.log(`  ${padDisplayEnd('native', 10)}✓ lbugjs.node loaded`);
-  } else {
-    console.log(`  ${padDisplayEnd('native', 10)}✗ lbugjs.node missing`);
+  console.log(nativeStatusLine(nativeCheck));
+  if (!nativeCheck.ok) {
     process.stderr.write(`\n${nativeCheck.message?.replace(/^/gm, '  ')}\n\n`);
   }
   console.log(`  ${label('doctor.labels.onnx', 10)}${fingerprint.onnxruntime ?? 'unknown'}`);
@@ -154,8 +250,32 @@ export const doctorCommand = async () => {
       console.log(`  ${padDisplayEnd('', 18)}${remedy}`);
     }
   }
-  console.log(`  ${label('doctor.labels.vectorIndex', 18)}${capabilities.vector}`);
-  console.log(`  ${label('doctor.labels.semanticMode', 18)}${capabilities.semanticMode}`);
+  // Live LOAD probe for VECTOR too (#2623). The static capability is just
+  // `platform !== 'win32'`, so it printed "available" on the very machines
+  // where analyze was failing to load the extension — the same contradiction
+  // #2374 fixed for FTS above, and exactly what #2623's reporter saw while
+  // every incremental analyze died on an unloaded VECTOR extension.
+  const vectorProbe = nativeCheck.ok
+    ? await probeVectorExtensionLoad()
+    : { loaded: false, reason: 'LadybugDB native module (lbugjs.node) failed to load' };
+  console.log(
+    `  ${label('doctor.labels.vectorIndex', 18)}${vectorProbe.loaded ? 'available' : 'unavailable'}`,
+  );
+  if (!vectorProbe.loaded && vectorProbe.reason) {
+    console.log(`  ${padDisplayEnd('', 18)}${vectorProbe.reason}`);
+    const { kind, remedy } = diagnoseExtensionLoad(vectorProbe.reason, 'VECTOR');
+    if (kind !== 'unknown') {
+      console.log(`  ${padDisplayEnd('', 18)}${remedy}`);
+    }
+  }
+  // Semantic mode follows the probe, not the platform: without a loadable
+  // VECTOR extension the index can be neither built nor queried, so search is
+  // really on exact scan no matter what the platform would allow.
+  console.log(
+    `  ${label('doctor.labels.semanticMode', 18)}${
+      vectorProbe.loaded ? capabilities.semanticMode : 'exact-scan'
+    }`,
+  );
   // Surface the optional-extension install policy so offline users can see
   // whether analyze/query will reach the network (extension.ladybugdb.com).
   // Literal label (like the 'native' line) to avoid adding i18n keys.

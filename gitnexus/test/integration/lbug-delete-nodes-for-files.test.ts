@@ -18,7 +18,7 @@
  *     the delete joins `e.nodeId = n.id` through the still-present nodes —
  *     deleted/quoted files' rows go, survivors' rows stay.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import path from 'path';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import { buildTestGraph, type TestNodeInput, type TestRelInput } from '../helpers/test-graph.js';
@@ -92,10 +92,14 @@ withTestLbugDB('delete-nodes-for-files', (handle) => {
       // is plain schema (no VECTOR extension involved).
       const SURVIVOR_PATH = filePath(FILE_COUNT - 1);
       const survivorEmbeddingNodeId = `Function:${SURVIVOR_PATH}:fn${FILE_COUNT - 1}:1`;
+      const survivorFileEmbeddingNodeId = `File:${SURVIVOR_PATH}`;
       const seededEmbeddingNodeIds = [
         `Function:${filePath(1)}:fn1:1`, // deleted, plain path
+        `File:${filePath(1)}`, // deleted fallback File embedding, plain path
         `Function:${QUOTED_PATH}:fn0:1`, // deleted, quoted path
+        `File:${QUOTED_PATH}`, // deleted fallback File embedding, quoted path
         survivorEmbeddingNodeId, // survives the delete
+        survivorFileEmbeddingNodeId, // fallback File embedding also survives
       ];
       await batchInsertEmbeddings(
         executeWithReusedStatement,
@@ -154,15 +158,17 @@ withTestLbugDB('delete-nodes-for-files', (handle) => {
       const embRows = (await executeQuery(
         `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN e.nodeId AS nodeId`,
       )) as Array<{ nodeId: string }>;
-      expect(embRows.map((r) => String(r.nodeId))).toEqual([survivorEmbeddingNodeId]);
+      expect(embRows.map((r) => String(r.nodeId)).sort()).toEqual(
+        [survivorEmbeddingNodeId, survivorFileEmbeddingNodeId].sort(),
+      );
 
       // Zero-match batch (all paths already gone) is a clean no-op.
       await expect(deleteNodesForFiles([QUOTED_PATH, filePath(1)])).resolves.toBeUndefined();
       // …and it left the surviving embedding row alone.
-      expect(await count(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS c`)).toBe(1);
+      expect(await count(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS c`)).toBe(2);
     }, 120_000);
 
-    it('a file whose only nodes carry non-embeddable labels deletes cleanly and leaves other files’ embedding rows intact (FIX 4)', async () => {
+    it('a File node without an embedding deletes cleanly and leaves other files’ embedding rows intact (FIX 4)', async () => {
       const { deleteNodesForFiles, executeQuery } =
         await import('../../src/core/lbug/lbug-adapter.js');
       const count = async (cypher: string): Promise<number> => {
@@ -170,9 +176,9 @@ withTestLbugDB('delete-nodes-for-files', (handle) => {
         return Number(rows[0]?.c ?? 0);
       };
 
-      // File is NOT an embeddable label, so the label-scoped embedding join
-      // (FIX 4) never binds it — the delete must still remove the node rows
-      // without erroring, and embedding rows owned by OTHER files stay put.
+      // File can own fallback embeddings, but this fixture deliberately has
+      // none. The delete must still remove the node row without erroring, and
+      // embedding rows owned by OTHER files stay put.
       const ASSET_PATH = 'src/assets-only.txt';
       await executeQuery(
         `CREATE (:File {id: 'File:${ASSET_PATH}', name: 'assets-only.txt', filePath: '${ASSET_PATH}'})`,
@@ -189,6 +195,39 @@ withTestLbugDB('delete-nodes-for-files', (handle) => {
       expect(await count(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS c`)).toBe(
         embeddingsBefore,
       );
+    }, 120_000);
+
+    it('deleteNodesForFile removes a fallback embedding owned by the File node', async () => {
+      const { deleteNodesForFile, executeQuery, executeWithReusedStatement } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
+      const count = async (cypher: string): Promise<number> => {
+        const rows = (await executeQuery(cypher)) as Array<{ c: number | bigint }>;
+        return Number(rows[0]?.c ?? 0);
+      };
+
+      const filePath = 'docs/singular.md';
+      const nodeId = `File:${filePath}`;
+      await executeQuery(
+        `CREATE (:File {id: '${nodeId}', name: 'singular.md', filePath: '${filePath}'})`,
+      );
+      await batchInsertEmbeddings(executeWithReusedStatement, [
+        {
+          nodeId,
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 1,
+          embedding: new Array(EMBEDDING_DIMS).fill(0),
+        },
+      ]);
+
+      await expect(deleteNodesForFile(filePath)).resolves.toEqual({ deletedNodes: 1 });
+      expect(
+        await count(
+          `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId = '${nodeId}' RETURN count(e) AS c`,
+        ),
+      ).toBe(0);
     }, 120_000);
   });
 });
@@ -234,6 +273,182 @@ withTestLbugDB('delete-nodes-missing-embedding-table', () => {
       // …and the connection stays healthy for subsequent batches.
       await expect(deleteNodesForFiles(['src/b.ts'])).resolves.toBeUndefined();
       expect(await count(`MATCH (n:Function) RETURN count(n) AS c`)).toBe(0);
+    }, 120_000);
+  });
+});
+
+/**
+ * VECTOR-extension gate for embedding-row DML (#2623).
+ *
+ * LadybugDB refuses EVERY mutation of a table carrying an HNSW index while
+ * the VECTOR extension is not loaded on the connection. The surgical
+ * incremental writeback's FIRST statement is `deleteNodesForFiles`' embedding
+ * join-delete, and nothing on that path loaded VECTOR until Phase 4 — so an
+ * incremental analyze over a DB that already had `code_embedding_idx` died
+ * with "Trying to delete from an index on table CodeEmbedding but its
+ * extension is not loaded".
+ *
+ * `ensureEmbeddingRowDmlSafe` is the seam that answers "is embedding-row DML
+ * legal right now?" before a single row is touched. Own withTestLbugDB block:
+ * these cases close and reopen the DB under a different extension-install
+ * policy, which would wreck the sibling suites' shared connection.
+ */
+withTestLbugDB('embedding-row-dml-vector-gate', (handle) => {
+  describe('ensureEmbeddingRowDmlSafe (#2623)', () => {
+    const FILE_A = 'src/gate-a.ts';
+    const FILE_B = 'src/gate-b.ts';
+    const nodeIdFor = (fp: string): string => `Function:${fp}:fn:1`;
+
+    /** Reopen the singleton connection under an explicit install policy. */
+    const reopenWithPolicy = async (policy: string | undefined): Promise<void> => {
+      const { initLbug, closeLbug } = await import('../../src/core/lbug/lbug-adapter.js');
+      await closeLbug();
+      if (policy === undefined) delete process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
+      else process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = policy;
+      await initLbug(handle.dbPath);
+    };
+
+    const seedTwoFilesWithEmbeddings = async (): Promise<void> => {
+      const { executeQuery, executeWithReusedStatement } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
+      for (const fp of [FILE_A, FILE_B]) {
+        await executeQuery(
+          `CREATE (:Function {id: '${nodeIdFor(fp)}', name: 'fn', filePath: '${fp}', startLine: 1, endLine: 3, isExported: true, content: '', description: ''})`,
+        );
+      }
+      await batchInsertEmbeddings(
+        executeWithReusedStatement,
+        [FILE_A, FILE_B].map((fp) => ({
+          nodeId: nodeIdFor(fp),
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: new Array(EMBEDDING_DIMS).fill(0.1),
+          contentHash: `hash-${fp}`,
+        })),
+      );
+    };
+
+    const embeddingCountFor = async (fp: string): Promise<number> => {
+      const { executeQuery } = await import('../../src/core/lbug/lbug-adapter.js');
+      const rows = (await executeQuery(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId = '${nodeIdFor(fp)}' RETURN count(e) AS c`,
+      )) as Array<{ c: number | bigint }>;
+      return Number(rows[0]?.c ?? 0);
+    };
+
+    const clearSeed = async (): Promise<void> => {
+      const { executeQuery } = await import('../../src/core/lbug/lbug-adapter.js');
+      await executeQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) DELETE e`);
+      await executeQuery(`MATCH (n:Function) DETACH DELETE n`);
+    };
+
+    afterEach(async () => {
+      await reopenWithPolicy(undefined);
+      // Teardown deletes embedding rows, so it is itself subject to #2623 once
+      // a case has built the index — load VECTOR before clearing.
+      const { ensureEmbeddingRowDmlSafe } = await import('../../src/core/lbug/lbug-adapter.js');
+      await ensureEmbeddingRowDmlSafe();
+      await clearSeed();
+    });
+
+    it('no vector index + VECTOR unavailable → safe, and the delete still works', async () => {
+      await seedTwoFilesWithEmbeddings();
+      await reopenWithPolicy('never');
+      const { ensureEmbeddingRowDmlSafe, deleteNodesForFiles } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+
+      // No HNSW index was ever built, so there is nothing to gate on — the
+      // degraded path must NOT escalate needlessly.
+      await expect(ensureEmbeddingRowDmlSafe()).resolves.toBe(true);
+      await expect(deleteNodesForFiles([FILE_A])).resolves.toBeUndefined();
+      expect(await embeddingCountFor(FILE_A)).toBe(0);
+      expect(await embeddingCountFor(FILE_B)).toBe(1);
+    }, 120_000);
+
+    it('vector index present + VECTOR unavailable → blocked, and the raw delete throws', async () => {
+      await seedTwoFilesWithEmbeddings();
+      const { createVectorIndex } = await import('../../src/core/lbug/lbug-adapter.js');
+      const built = await createVectorIndex();
+      if (!built) return; // VECTOR not installable here — nothing to assert.
+
+      await reopenWithPolicy('never');
+      const { ensureEmbeddingRowDmlSafe, deleteNodesForFiles } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+
+      // The gate must SEE the hazard…
+      await expect(ensureEmbeddingRowDmlSafe()).resolves.toBe(false);
+      // …and the hazard must be real: this is the exact #2623 failure.
+      await expect(deleteNodesForFiles([FILE_A])).rejects.toThrow(/extension is not loaded/);
+      // Nothing was destroyed by the refused statement.
+      expect(await embeddingCountFor(FILE_A)).toBe(1);
+    }, 120_000);
+
+    it('vector index present + VECTOR loadable → safe, delete works, index survives', async () => {
+      await seedTwoFilesWithEmbeddings();
+      const { createVectorIndex } = await import('../../src/core/lbug/lbug-adapter.js');
+      const built = await createVectorIndex();
+      if (!built) return; // VECTOR not installable here — nothing to assert.
+
+      // Reopen so the in-process "already loaded" latch cannot mask a missing
+      // load — this is the state a second `analyze` run actually starts from.
+      await reopenWithPolicy(undefined);
+      const { ensureEmbeddingRowDmlSafe, deleteNodesForFiles, executeQuery } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+
+      await expect(ensureEmbeddingRowDmlSafe()).resolves.toBe(true);
+      await expect(deleteNodesForFiles([FILE_A])).resolves.toBeUndefined();
+      expect(await embeddingCountFor(FILE_A)).toBe(0);
+      expect(await embeddingCountFor(FILE_B)).toBe(1);
+
+      // The surgical path KEEPS its index (run-analyze relies on HNSW
+      // self-maintaining across insert/delete) — it must still be there.
+      const indexes = (await executeQuery('CALL SHOW_INDEXES() RETURN *')) as Array<{
+        table_name?: string;
+        index_type?: string;
+      }>;
+      expect(
+        indexes.some((r) => r.table_name === EMBEDDING_TABLE_NAME && r.index_type === 'HNSW'),
+      ).toBe(true);
+    }, 120_000);
+
+    it('catalog read fails → falls back to attempting the extension load (fail-safe)', async () => {
+      // The one branch where the gate cannot cheaply prove safety: SHOW_INDEXES
+      // itself errors. It must fall through to loadVectorExtension — in this
+      // environment the extension IS loadable, so the verdict is still `true`
+      // and DML proceeds safely despite the unreadable catalog.
+      await seedTwoFilesWithEmbeddings();
+      // Reopen so the module-level "already loaded" latch cannot let
+      // loadVectorExtension return true without issuing a LOAD statement.
+      await reopenWithPolicy('load-only');
+      const { ensureEmbeddingRowDmlSafe } = await import('../../src/core/lbug/lbug-adapter.js');
+      const { default: lbug } = await import('@ladybugdb/core');
+
+      const originalQuery = lbug.Connection.prototype.query;
+      const seen: string[] = [];
+      const spy = vi.spyOn(lbug.Connection.prototype, 'query').mockImplementation(function (
+        this: unknown,
+        sql: string,
+        ...rest: unknown[]
+      ) {
+        seen.push(sql);
+        if (sql.includes('SHOW_INDEXES')) {
+          return Promise.reject(new Error('Catalog exception: forced by test'));
+        }
+        return originalQuery.call(this, sql, ...rest);
+      });
+
+      try {
+        await expect(ensureEmbeddingRowDmlSafe()).resolves.toBe(true);
+        // The catalog read was attempted and failed…
+        expect(seen.some((s) => s.includes('SHOW_INDEXES'))).toBe(true);
+        // …and the fallback really attempted the LOAD instead of guessing.
+        expect(seen.some((s) => s.toUpperCase().includes('LOAD'))).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
     }, 120_000);
   });
 });
