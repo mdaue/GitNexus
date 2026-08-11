@@ -85,9 +85,10 @@
  * ## Correctness contract
  *
  * Structural sibling of {@link PdgEmitSink}, and reuses its row builder
- * (`buildRelRow`), header (`REL_CSV_HEADER`), label derivation (`getNodeLabel`)
- * and `RelPairRouter` validity check, so the streamed row SET equals the
- * whole-graph emit's and the bulk COPY loads the same rows. Set-level, not
+ * (`buildRelRow`), header (`REL_CSV_HEADER`) and pair classification
+ * (`relPairKeyFor`, which is also what `RelPairRouter` routes and skips by), so
+ * the streamed row SET equals the whole-graph emit's and the bulk COPY loads
+ * the same rows. Set-level, not
  * byte-level: rows stream in emit order and are not re-sorted under
  * `GITNEXUS_SORT_GRAPH_OUTPUT`.
  */
@@ -95,10 +96,15 @@ import fs from 'fs';
 import path from 'path';
 import type { GraphNode, GraphRelationship, RelationshipType } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../graph/types.js';
-import { REL_CSV_HEADER, buildRelRow } from './csv-generator.js';
-import { getNodeLabel } from './rel-pair-routing.js';
-import { NODE_TABLES } from './schema.js';
+import { DECLARED_RELATION_PAIRS, REL_CSV_HEADER, buildRelRow } from './csv-generator.js';
+import {
+  VALID_NODE_TABLES,
+  assertDeclaredPair,
+  relPairKeyFor,
+  splitRelPairKey,
+} from './rel-pair-routing.js';
 import { DEFAULT_EMIT_CHUNK_ROWS, SyncCsvWriter } from './sync-csv-writer.js';
+import { PDG_EDGE_TYPES } from './pdg-emit-sink.js';
 
 /**
  * Relationship types that MUST stay in the in-memory graph because a phase
@@ -127,8 +133,8 @@ import { DEFAULT_EMIT_CHUNK_ROWS, SyncCsvWriter } from './sync-csv-writer.js';
  * `routes`/`tools`, never read back mid-pipeline).
  *
  * Adding a relationship type that a phase reads back WITHOUT adding it here is
- * a silent-wrong-graph bug, not a crash — and NOTHING automated catches it.
- * The differential round-trip test cannot: `addRelationship` partitions edges
+ * a silent-wrong-graph bug, not a crash. The differential round-trip test cannot:
+ * `addRelationship` partitions edges
  * between the graph and the CSVs, and the union of a partition is invariant
  * under where the partition line falls, so that test stays green no matter how
  * this set is drawn. Only the read-site audit protects this invariant; re-run it
@@ -144,6 +150,8 @@ export const RETAINED_REL_TYPES: ReadonlySet<RelationshipType> = new Set<Relatio
   'METHOD_IMPLEMENTS',
   'DEFINES',
   'INJECTS',
+  // springAopInheritance reads direct behavior evidence after MRO.
+  'ADVISED_BY',
 ]);
 
 /**
@@ -160,6 +168,22 @@ export interface GraphEmitManifest {
   readonly relsByPair: Map<string, { csvPath: string; rows: number }>;
   /** Total streamed rows, for the buffer-pool size hint (#2631 path). */
   readonly totalRows: number;
+  /**
+   * Streamed rows EXCLUDING `PDG_EDGE_TYPES`, for the graph-write-collapse
+   * check — which counts persisted STRUCTURAL rows and so needs a structural
+   * expectation to compare against.
+   *
+   * Not derivable from `relsByPair`: a pair key is `From|To` NODE LABELS, and
+   * a PDG edge shares `Function|Function` with `CALLS`. Only the write path
+   * sees `relationship.type`, so the split has to be counted here.
+   *
+   * This existed as a bug first. `totalRows` is a buffer-pool size hint and
+   * counts every row; the collapse check reused it as the expectation while
+   * measuring structural rows on the other side. On a `--pdg` run that compared
+   * ~200k against ~65k and declared a healthy index INCOMPLETE — then the
+   * collapse stamp forced a rebuild on the next run, which did it again.
+   */
+  readonly structuralRows: number;
 }
 
 /**
@@ -227,7 +251,6 @@ export class StreamedRelationshipRemovalError extends Error {
  * {@link finalize} once after the pipeline, before `loadGraphToLbug`.
  */
 export class GraphEmitSink implements KnowledgeGraph, GraphEmitControl {
-  private readonly validTables: Set<string>;
   private readonly relWriters = new Map<string, SyncCsvWriter>();
   /**
    * Ids of relationships already streamed. `KnowledgeGraph.addRelationship`
@@ -301,7 +324,6 @@ export class GraphEmitSink implements KnowledgeGraph, GraphEmitControl {
     private readonly csvDir: string,
     private readonly chunkRows: number = DEFAULT_EMIT_CHUNK_ROWS,
   ) {
-    this.validTables = new Set<string>(NODE_TABLES as readonly string[]);
     // Own directory, distinct from the PDG sink's: PdgEmitSink wipes and
     // recreates its dir on construction and opens with O_EXCL, so a shared dir
     // would destroy the other sink's manifest on a combined --pdg run.
@@ -405,15 +427,24 @@ export class GraphEmitSink implements KnowledgeGraph, GraphEmitControl {
     }
     // Mirror KnowledgeGraph.addRelationship's first-writer-wins dedup.
 
-    const fromLabel = getNodeLabel(relationship.sourceId);
-    const toLabel = getNodeLabel(relationship.targetId);
-    // Skip edges whose endpoint labels are not valid node tables — mirrors
-    // `RelPairRouter` exactly so the streamed set matches the whole-graph set.
-    if (!this.validTables.has(fromLabel) || !this.validTables.has(toLabel)) return;
+    // Classify + skip via the SHARED `relPairKeyFor`, not a local copy of its
+    // three lines, so the streamed set cannot drift from the whole-graph set
+    // `RelPairRouter` produces. `undefined` = an endpoint label is not a node
+    // table, so the edge is dropped exactly as the router drops it.
+    const pairKey = relPairKeyFor(relationship.sourceId, relationship.targetId, VALID_NODE_TABLES);
+    if (pairKey === undefined) return;
 
-    const pairKey = `${fromLabel}|${toLabel}`;
+    assertDeclaredPair(
+      pairKey,
+      DECLARED_RELATION_PAIRS,
+      relationship.type,
+      relationship.sourceId,
+      relationship.targetId,
+    );
     let writer = this.relWriters.get(pairKey);
     if (writer === undefined) {
+      // Cold: once per pair, so decoding the key back into its labels is free.
+      const [fromLabel, toLabel] = splitRelPairKey(pairKey);
       try {
         writer = new SyncCsvWriter(
           path.join(this.csvDir, `rel_${fromLabel}_${toLabel}.csv`),
@@ -434,6 +465,7 @@ export class GraphEmitSink implements KnowledgeGraph, GraphEmitControl {
     this.streamedIds.add(key);
 
     writer.addRow(buildRelRow(relationship));
+    if (!PDG_EDGE_TYPES.has(relationship.type)) this.structuralRows++;
     this.srcIx.push(srcIx);
     this.tgtIx.push(tgtIx);
     this.relTypes.push(relationship.type);
@@ -445,6 +477,9 @@ export class GraphEmitSink implements KnowledgeGraph, GraphEmitControl {
    *  a final-flush failure, or a writer-open failure (EMFILE) — is surfaced
    *  loudly here so a disk-full / out-of-fds run never hands a truncated CSV to
    *  the bulk COPY. */
+  /** Streamed rows that are not PDG — see `GraphEmitManifest.structuralRows`. */
+  private structuralRows = 0;
+
   finalize(): GraphEmitManifest {
     if (this.finalized) throw new Error('GraphEmitSink.finalize() called twice');
     this.finalized = true;
@@ -472,7 +507,7 @@ export class GraphEmitSink implements KnowledgeGraph, GraphEmitControl {
       );
     }
 
-    return { relsByPair, totalRows };
+    return { relsByPair, totalRows, structuralRows: this.structuralRows };
   }
 
   /** Best-effort fd release for the error path — when the pipeline throws

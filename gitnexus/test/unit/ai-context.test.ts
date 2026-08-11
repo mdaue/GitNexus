@@ -122,7 +122,10 @@ describe('generateAIContextFiles', () => {
         expect(content).toContain('`node .gitnexus/run.cjs analyze`');
         expect(content).not.toContain('run `gitnexus analyze`'); // no machine-resolved leak
         // Bootstrap path (for a not-yet-analyzed checkout) + npm-11 escape hatch.
-        expect(content).toContain('npx gitnexus analyze');
+        // Every install-free runner is named, so a machine without npm (bun-only)
+        // still finds a bootstrap command it can actually run.
+        expect(content).toContain('`npx`, `bunx`, or `pnpm dlx`');
+        expect(content).toContain('bunx gitnexus@latest analyze');
         expect(content).toContain('1939');
       }
     } finally {
@@ -149,6 +152,62 @@ describe('generateAIContextFiles', () => {
     expect(content).not.toMatch(/npx gitnexus group/);
   });
 
+  it('pairs mandatory MCP checks with project-local CLI fallbacks (#2671)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-ai-ctx-transport-fallback-'));
+    const storage = path.join(dir, '.gitnexus');
+    await fs.mkdir(storage, { recursive: true });
+    try {
+      await generateAIContextFiles(
+        dir,
+        storage,
+        'TransportFallback',
+        { nodes: 50, edges: 100, processes: 5 },
+        undefined,
+        { defaultBranch: 'develop' },
+      );
+
+      for (const file of ['AGENTS.md', 'CLAUDE.md']) {
+        const content = await fs.readFile(path.join(dir, file), 'utf-8');
+        expect(content).toContain('impact({target: "symbolName", direction: "upstream"})');
+        expect(content).toContain(
+          'node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .',
+        );
+        expect(content).toContain('detect_changes({scope: "all"})');
+        expect(content).toContain('node .gitnexus/run.cjs detect-changes --scope all --repo .');
+        expect(content).toContain('detect_changes({scope: "compare", base_ref: "develop"})');
+        expect(content).toContain('--scope compare --base-ref "develop" --repo .');
+        expect(content).toContain('Never substitute grep for graph analysis');
+        expect(content).not.toContain('gitnexus impact --target');
+      }
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the configured runner for transport fallbacks, including PDG impact (#2671)', () => {
+    const content = generateGitNexusContent(
+      'TransportFallback',
+      { nodes: 50, edges: 100, processes: 5 },
+      {
+        runnerPath: '.custom/gitnexus-runner.cjs',
+        hasPdg: true,
+      },
+    );
+
+    expect(content).toContain(
+      'node .custom/gitnexus-runner.cjs impact "symbolName" --direction upstream --repo .',
+    );
+    expect(content).toContain(
+      'node .custom/gitnexus-runner.cjs detect-changes --scope all --repo .',
+    );
+    expect(content).toContain(
+      'node .custom/gitnexus-runner.cjs impact "symbolName" --direction upstream --mode pdg --line <N> --repo .',
+    );
+    expect(content).toContain('--mode pdg');
+    expect(content).toContain('--line <N>');
+    expect(content).not.toContain('node .gitnexus/run.cjs impact');
+  });
+
   it('gates the pdg_query line on hasPdg (#2086 M6 — no existing taint gate to mirror)', () => {
     const stats = { nodes: 50, edges: 100, processes: 5 };
     // hasPdg=true → the pdg_query line is present.
@@ -166,10 +225,24 @@ describe('generateAIContextFiles', () => {
     expect(withoutPdg).toContain('explain(');
   });
 
+  it('emits MD060-compatible compact tables in generated docs (#2709)', () => {
+    const content = generateGitNexusContent('MarkdownProject', {
+      nodes: 50,
+      edges: 100,
+      processes: 5,
+    });
+
+    expect(content).toContain('| Resource | Use for |\n| --- | --- |\n');
+    expect(content).toContain('| Task | Read this skill file |\n| --- | --- |\n');
+    expect(content).not.toContain('|----------|---------|');
+    expect(content).not.toContain('|------|---------------------|');
+  });
+
   it('degrades gracefully when the runner copy fails (#1945)', async () => {
     // A read-only/full-disk storage dir must not abort generation. The copy is
     // best-effort + logged; the generated docs still carry the inline bootstrap
-    // (`npx gitnexus analyze`) so a reader hitting the absent runner has a path.
+    // (`bunx gitnexus@latest analyze`) so a reader hitting the absent runner has
+    // a path.
     const subDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-copyfail-'));
     const subStorage = path.join(subDir, '.gitnexus');
     await fs.mkdir(subStorage, { recursive: true });
@@ -179,7 +252,7 @@ describe('generateAIContextFiles', () => {
       // Must not throw despite the copy failure.
       await generateAIContextFiles(subDir, subStorage, 'CopyFail', stats);
       const content = await fs.readFile(path.join(subDir, 'CLAUDE.md'), 'utf-8');
-      expect(content).toContain('npx gitnexus analyze'); // bootstrap survives
+      expect(content).toContain('bunx gitnexus@latest analyze'); // bootstrap survives
       // The runner was not written, so the file is absent.
       await expect(fs.access(path.join(subStorage, 'run.cjs'))).rejects.toThrow();
     } finally {
@@ -235,8 +308,36 @@ describe('generateAIContextFiles', () => {
     // legitimate future additions but will fail loudly if the trim is
     // reverted or someone pads the block back out toward the original size.
     //
-    // Raised 2900 → 3600: added pdg-query, taint-analysis, and pr-review skill rows,
-    // trace tool directive, and graph schema/group resources.
+    // Raised 2700 → 2900 for #243, then 2900 → 2950 for the bunx bootstrap note,
+    // then 0.55 → 0.65 for the #2899 `risk: UNKNOWN` Always-Do bullet + Never-Do
+    // clause (previously hand-added inside the committed docs instead of this
+    // template, so a real `gitnexus analyze` silently deleted them on every
+    // regeneration — moving them into the template is the fix, and they are
+    // unconditional text load-bearing enough to warrant the budget) — each time
+    // with the same argument, that the added line is load-bearing and the block
+    // is still meaningfully smaller than the original. That is a ratchet with no
+    // ratchet: an absolute cap can only ever fail on the PR that adds the
+    // character, and the fix is always to nudge the number. Assert the invariant
+    // the justifications actually appeal to — the RATIO to the pre-trim size —
+    // so a legitimate clause fits without ceremony while a genuine re-pad fails.
+    // (The structural guard is the sibling test asserting the six #856 section
+    // headers stay deleted; this one bounds bulk.)
+    //
+    // 0.65 → 0.85 merging the semantic-search branch, which independently added
+    // the pdg-query/taint-analysis/pr-review skill rows, the `trace` directive,
+    // the query-first search bullets, and the schema/group resource rows on top
+    // of the CLI-fallback and `risk: UNKNOWN` text above. Flagging this honestly
+    // rather than replaying the justification: at 0.85 the ratio no longer
+    // asserts anything much — the block is now only ~15% under the size the #856
+    // trim was supposed to fix, and two branches each adding "load-bearing"
+    // directives is exactly how it got there. The block now states the
+    // don't-grep rule three times (the #2671 impact clause, the Always-Do
+    // `query` bullet, and the Never-Do bullet) because each side added its own
+    // and #2671 pins one of them; the next addition should come with a real
+    // re-trim that reconciles those, not another nudge to this number. The
+    // structural guard is the sibling test asserting the six
+    // #856 section headers stay deleted; this one only bounds bulk.
+    const PRE_TRIM_BLOCK_CHARS = 5465;
     const stats = { nodes: 50, edges: 100, processes: 5 };
     await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
 
@@ -245,7 +346,7 @@ describe('generateAIContextFiles', () => {
       content.indexOf('<!-- gitnexus:start -->'),
       content.indexOf('<!-- gitnexus:end -->'),
     );
-    expect(block.length).toBeLessThan(3800);
+    expect(block.length).toBeLessThan(PRE_TRIM_BLOCK_CHARS * 0.85);
   });
 
   it('handles empty stats', async () => {
@@ -1166,7 +1267,7 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
     // tool that does not exist.
     expect(content).not.toMatch(/gitnexus_(impact|query|context|detect_changes|rename|cypher)/);
     expect(content).toContain('impact({target: "symbolName", direction: "upstream"})');
-    expect(content).toContain('detect_changes()');
+    expect(content).toContain('detect_changes({scope: "all"})');
     // #2175: the generated guidance must advertise the renamed param, never the
     // legacy "query" key (Claude Code drops a tool arg named exactly "query").
     expect(content).toContain('query({search_query: "concept"})');
@@ -1179,6 +1280,7 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
     // raw, so it stays inside the inline code span.
     const content = generateGitNexusContent('P', { nodes: 1 }, { defaultBranch: 'we"ird' });
     expect(content).toContain('base_ref: "we\\"ird"');
+    expect(content).toContain('--base-ref "we\\"ird" --repo .');
   });
 
   it('a backtick branch cannot break the generated Markdown code span (#1996 P1)', () => {

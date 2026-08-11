@@ -121,7 +121,8 @@ export interface GitNexusContentOptions {
   skipSkills?: boolean;
   /** Project-relative path to the runner `gitnexus analyze` drops next to the
    *  index (#1945). Referenced by docs so a single CLI-neutral command resolves
-   *  the available runner (global `gitnexus` → `pnpm dlx` → `npx`) at call time. */
+   *  the available runner (global `gitnexus` → `pnpm dlx` → `bunx` → `npx`) at
+   *  call time. */
   runnerPath?: string;
   /** Default branch for the regression-compare example (#243). Configurable so
    *  projects on `develop`/`master`/etc. don't get `base_ref: "main"` rewritten
@@ -181,7 +182,7 @@ export function generateGitNexusContent(
   const tableBody = [standardSkillsRows, generatedRows].filter(Boolean).join('\n');
   const skillsTable = tableBody
     ? `| Task | Read this skill file |
-|------|---------------------|
+| --- | --- |
 ${tableBody}`
     : '';
   // Docs reference the project-local runner `gitnexus analyze` writes (#1945):
@@ -190,27 +191,34 @@ ${tableBody}`
   // stay under the CLAUDE.md block token budget (#856); the cli skill carries the
   // full bootstrap + npm-11 fallback (`node.target is null` npx install crash).
   const runner = `node ${runnerPath}`;
+  // Bootstrap names every install-free one-shot rather than the one this machine
+  // resolves to: the block is committed, so a host-specific command would make
+  // two contributors on different package managers rewrite it at each other on
+  // every analyze (the per-machine churn of #1706). `bunx` is listed because a
+  // bun-only machine has no npm, npx or pnpm at all, and the npx-only note left
+  // it with a bootstrap command it could not run.
   const bootstrapNote =
-    `No \`${runnerPath}\` yet? \`npx gitnexus analyze\` ` +
-    '(npm 11 crash → `npm i -g gitnexus`; #1939).';
+    `No \`${runnerPath}\` yet? Bootstrap with \`npx\`, \`bunx\`, or \`pnpm dlx\` — ` +
+    'e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).';
 
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows)`}. Use GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows)`}. Use GitNexus graph tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run \`${runner} analyze\` from project root (add \`--embeddings\` for semantic search, \`--pdg\` for taint/flow analysis). ${bootstrapNote}
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Run \`impact({target: "symbolName", direction: "upstream"})\` and report blast radius (callers, affected processes, risk) to the user.${
+- **MUST run impact analysis before editing.** Use \`impact({target: "symbolName", direction: "upstream"})\` (MCP) or \`${runner} impact "symbolName" --direction upstream --repo .\` (CLI fallback); report callers, processes, and risk. Never substitute grep for graph analysis.${
     hasPdg
-      ? ` For unified PDG impact, add \`mode: "pdg"\` with optional \`line: <N>\` — it returns statement-level \`affectedStatements\` over CDG + REACHING_DEF and inter-procedural symbols in \`interproceduralByDepth\`/\`byDepth\`; no-layer/degraded PDG results are UNKNOWN-risk notes (\`--pdg\` layer).`
+      ? ` For unified PDG impact, add \`mode: "pdg"\` with optional \`line: <N>\` — it returns statement-level \`affectedStatements\` over CDG + REACHING_DEF and inter-procedural symbols in \`interproceduralByDepth\`/\`byDepth\`; no-layer/degraded PDG results are UNKNOWN-risk notes (\`--pdg\` layer). CLI equivalent: \`${runner} impact "symbolName" --direction upstream --mode pdg --line <N> --repo .\`.`
       : ''
   }
-- **MUST run \`detect_changes()\` before committing** to verify changed scope. Compare against default branch: \`detect_changes({scope: "compare", base_ref: ${JSON.stringify(markdownSafeBranch(defaultBranch))}})\`.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before editing.
-- **MUST use \`query({search_query: "concept"})\` for codebase search** (hybrid BM25 + vector search RRF) instead of grepping or filesystem search tools.
+- **MUST analyze graph changes before committing.** Use \`detect_changes({scope: "all"})\` (MCP) or \`${runner} detect-changes --scope all --repo .\` (CLI fallback). For regression review: \`detect_changes({scope: "compare", base_ref: ${JSON.stringify(markdownSafeBranch(defaultBranch))}})\` or \`${runner} detect-changes --scope compare --base-ref ${JSON.stringify(markdownSafeBranch(defaultBranch))} --repo .\`.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- **MUST treat \`risk: UNKNOWN\` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). \`impact\` pairs \`UNKNOWN\` with a \`riskNote\` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
+- **MUST use \`query({search_query: "concept"})\` for codebase search** (hybrid BM25 + vector search RRF) instead of grepping. It returns process-grouped results ranked by relevance.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use \`context({name: "symbolName"})\`.
 - When tracing how symbol A reaches symbol B, use \`trace({from: "A", to: "B"})\` instead of manual multi-hop chaining.
 - For security review, \`explain({target: "fileOrSymbol"})\` lists taint findings (source→sink flows; needs \`analyze --pdg\})\`.${
@@ -221,16 +229,16 @@ This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${s
 
 ## Never Do
 
-- NEVER edit a function, class, or method without first running \`impact\` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER edit a function, class, or method before MCP/CLI impact analysis.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis, and never read \`UNKNOWN\` as an all-clear — it means the walk could not answer, which is the one verdict that requires confirming by other means.
 - NEVER rename symbols with find-and-replace — use \`rename\` which understands the call graph.
-- NEVER commit changes without running \`detect_changes()\` to check affected scope.
-- NEVER use filesystem search tools (\`grep\`, \`ripgrep\`, \`find\`) to search the repository — use \`query({search_query: "concept"})\` for semantic search across execution flows and code definitions.
+- NEVER commit before MCP/CLI graph change analysis.
+- NEVER reach for \`grep\`/\`ripgrep\`/\`find\` to explore the repository — use \`query({search_query: "concept"})\`; text search is for confirming an \`UNKNOWN\` risk verdict, not for discovery.
 
 ## Resources
 
 | Resource | Use for |
-|----------|---------|
+| --- | --- |
 | \`gitnexus://repo/${projectName}/context\` | Codebase overview, check index freshness |
 | \`gitnexus://repo/${projectName}/clusters\` | All functional areas |
 | \`gitnexus://repo/${projectName}/processes\` | All execution flows |

@@ -15,6 +15,8 @@ import v8 from 'v8';
 import cliProgress from 'cli-progress';
 import { isLbugReady, LbugWipeError } from '../core/lbug/lbug-adapter.js';
 import { boundedCheckpointBeforeExit } from '../core/lbug/shutdown-helpers.js';
+import { findUndeclaredRelationPairError } from '../core/lbug/rel-pair-routing.js';
+import { causeChain } from '../lib/utils.js';
 import {
   getOsPageSize,
   isLbugCheckpointIoError,
@@ -101,15 +103,13 @@ const writeFatalToStderr = (label: string, err: unknown): void => {
   // #2068) is only reachable via `.cause`. Without this the user sees the
   // wrapper's main-thread stack and never the real frame. `cause.stack` already
   // begins with the cause's message, so we print the stack alone (not message +
-  // stack) to avoid repeating it. Depth-bounded so a cyclic `cause` can't loop
-  // (the phase runner wraps one level; the bound leaves headroom for future
-  // nesting); uses realStderrWrite so the redirected console.error's ANSI
-  // clear-line wrapping can't erase it (#1169).
-  const MAX_CAUSE_DEPTH = 5;
-  let cause: unknown = isErr ? (err as { cause?: unknown }).cause : undefined;
-  for (let depth = 0; depth < MAX_CAUSE_DEPTH && cause instanceof Error; depth++) {
+  // stack) to avoid repeating it. `causeChain` owns the traversal and the depth
+  // bound that stops a cyclic `cause` looping — this used to be one of four
+  // hand-rolled copies that had already drifted apart on both. Uses
+  // realStderrWrite so the redirected console.error's ANSI clear-line wrapping
+  // can't erase it (#1169). The head is skipped: it was just printed above.
+  for (const cause of causeChain(isErr ? (err as { cause?: unknown }).cause : undefined)) {
     realStderrWrite(`\n  Caused by: ${cause.stack ?? cause.message}\n`);
-    cause = (cause as { cause?: unknown }).cause;
   }
 };
 
@@ -1624,6 +1624,27 @@ const analyzeCommandImpl = async (
 
     // ── Summary ────────────────────────────────────────────────────
     const s = result.stats;
+    // A collapsed graph write is NOT a successful index. The other incomplete
+    // reasons (`incremental-in-progress`, `embedding-checkpoint-pending`)
+    // describe a run that did what it said and left work for next time; this
+    // one means most of your edges are gone, so every query answers a confident
+    // empty and the exit code is the only thing automation reads. Printing
+    // "indexed successfully" and exiting 0 here would be the same class of
+    // false certainty the check itself was written to remove.
+    if (result.graphWriteCollapsed) {
+      const { expected, persisted } = result.graphWriteCollapsed;
+      console.log(`\n  Repository indexed INCOMPLETELY (${totalTime}s)\n`);
+      console.log(
+        `  Graph write collapsed: the pipeline produced ${expected.toLocaleString()} relationships\n` +
+          `  but only ${persisted.toLocaleString()} are readable from the index. Queries will answer\n` +
+          `  with missing edges rather than an error.\n\n` +
+          `  The index is recorded INCOMPLETE (graph-write-collapsed). Re-run\n` +
+          `  \`gitnexus analyze --force\`; if it recurs, check disk space and run \`gitnexus doctor\`.`,
+      );
+      console.log(`  ${repoPath}`);
+      process.exitCode = 1;
+      return;
+    }
     console.log(`\n  Repository indexed successfully (${totalTime}s)\n`);
     console.log(
       `  ${(s.nodes ?? 0).toLocaleString()} nodes | ${(s.edges ?? 0).toLocaleString()} edges | ${s.communities ?? 0} clusters | ${s.processes ?? 0} flows`,
@@ -1644,9 +1665,14 @@ const analyzeCommandImpl = async (
         );
       } else {
         console.log(
+          // NOT "then rerun" (#2841 §5.C): this run stamped `lastCommit`, so a
+          // plain rerun on an unchanged tree takes the up-to-date fast path and
+          // returns before Phase 3 could rebuild anything — the advice would be
+          // ineffective exactly when the user follows it. `--repair-fts` is the
+          // verb that rebuilds the search indexes without re-parsing the repo.
           `\n  Warning: full-text/BM25 search is disabled — the LadybugDB FTS extension was unavailable.\n` +
-            `  Install it once with network access (GITNEXUS_LBUG_EXTENSION_INSTALL=auto) then rerun, or\n` +
-            `  run \`gitnexus analyze --repair-fts\` when connected. Run \`gitnexus doctor\` for details.`,
+            `  Install it once with network access (GITNEXUS_LBUG_EXTENSION_INSTALL=auto), then run\n` +
+            `  \`gitnexus analyze --repair-fts\` to build the search indexes. Run \`gitnexus doctor\` for details.`,
         );
       }
     }
@@ -1713,6 +1739,36 @@ const analyzeCommandImpl = async (
           `    3. If the failure persists, run with NODE_OPTIONS="--max-old-space-size=8192 --trace-exit"\n` +
           `       and attach the trace to the GitNexus issue tracker.\n\n`,
       );
+      process.exitCode = 1;
+      return;
+    }
+
+    // An extracted edge whose FROM→TO label pair is missing from GitNexus's own
+    // relation DDL (#2789). `assertDeclaredPair` aborts the run rather than let
+    // the bulk COPY fail late and silently drop the edge, so the user sees a
+    // mid-run crash inside GitNexus internals with nothing to act on. Name the
+    // pair, the relationship and the file that produced it, and say plainly that
+    // a re-run cannot help — this is deterministic for the same input.
+    // Checked by TYPE (repo norm, #2385) BEFORE the message-text heuristics
+    // below, and through the `cause` chain because the ingestion phase runner
+    // rewraps every phase failure as `Phase 'X' failed: …`.
+    const undeclaredPair = findUndeclaredRelationPairError(err);
+    if (undeclaredPair !== undefined) {
+      // Render the error's OWN message indented — same idiom as the
+      // `LbugWipeError` and page-size branches below. `UndeclaredRelationPairError`
+      // builds a fully self-contained message (pair, relationship type, both node
+      // ids, source file, issue URL, `.gitnexusignore` workaround) precisely
+      // because `gitnexus serve` forwards only `err.message` over worker IPC.
+      // Re-rendering those fields here would be a second copy of one string, free
+      // to drift from the first — and the actionable half would reach CLI users
+      // only. `undeclaredPair.message`, not the outer `msg`: the real error may be
+      // several `cause` levels below the phase wrapper `msg` came from.
+      cliError(`  ${undeclaredPair.message.replace(/\n/g, '\n  ')}\n`, {
+        recoveryHint: 'undeclared-relation-pair',
+        labelPair: undeclaredPair.pairKey,
+        relationType: undeclaredPair.relationType,
+        sourceFile: undeclaredPair.sourceFile,
+      });
       process.exitCode = 1;
       return;
     }

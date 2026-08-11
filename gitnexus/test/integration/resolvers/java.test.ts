@@ -1,8 +1,10 @@
 /**
  * Java: class extends + implements multiple interfaces + ambiguous package disambiguation
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'path';
+import fs from 'node:fs';
+import os from 'node:os';
 import {
   FIXTURES,
   CROSS_FILE_FIXTURES,
@@ -10,7 +12,9 @@ import {
   getNodesByLabel,
   getNodesByLabelFull,
   edgeSet,
+  getResolutionOutcomes,
   runPipelineFromRepo,
+  writeFixtureRepo,
   type PipelineResult,
 } from './helpers.js';
 
@@ -1241,6 +1245,100 @@ describe('Java record method resolution (#2564)', () => {
     const sumCall = calls.find((c) => c.target === 'sum' && c.source === 'scaled');
     expect(sumCall).toBeDefined();
   });
+
+  it('uses the Record node as a caller source and constructor-call target (#2801)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-record-link-'));
+    try {
+      writeFixtureRepo(root, {
+        'Point.java': `package probe;
+          public record Point(int x) {
+            private static final int SEED = initialize();
+            private static int initialize() { return 1; }
+          }`,
+        'Use.java':
+          'package probe; public class Use { public Point make() { return new Point(1); } }',
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const initializerCall = getRelationships(linked, 'CALLS').find(
+        (edge) => edge.source === 'Point' && edge.target === 'initialize',
+      );
+      expect(initializerCall?.sourceLabel).toBe('Record');
+
+      const constructorCall = getRelationships(linked, 'CALLS').find(
+        (edge) => edge.source === 'make' && edge.target === 'Point',
+      );
+      expect(constructorCall?.targetLabel).toBe('Record');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it('links and dispatches an explicit Record interface method (#2900)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-record-heritage-'));
+    try {
+      writeFixtureRepo(root, {
+        'RecordHeritage.java': `interface Named { String name(); }
+          record User(String value) implements Named {
+            public String name() { return value; }
+          }
+          class Reader {
+            String read(Named value) { return value.name(); }
+          }`,
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const implementsEdge = getRelationships(linked, 'IMPLEMENTS').find(
+        (edge) => edge.source === 'User' && edge.target === 'Named',
+      );
+      const fanout = getRelationships(linked, 'CALLS').filter(
+        (edge) =>
+          edge.source === 'read' &&
+          edge.target === 'name' &&
+          edge.rel.reason === 'interface-dispatch',
+      );
+
+      expect(implementsEdge?.sourceLabel).toBe('Record');
+      expect(implementsEdge?.targetLabel).toBe('Interface');
+      expect(fanout.map((edge) => `${edge.targetLabel}:${edge.targetFilePath}`).sort()).toEqual([
+        'Method:RecordHeritage.java',
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it('documents missing dispatch to an implicit Record component accessor (#2917)', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-java-record-accessor-'));
+    try {
+      writeFixtureRepo(root, {
+        'RecordAccessor.java': `interface Named { String name(); }
+          record User(String name) implements Named {}
+          class Reader {
+            String read(Named value) { return value.name(); }
+          }`,
+      });
+
+      const linked = await runPipelineFromRepo(root, () => {});
+      const implementsEdge = getRelationships(linked, 'IMPLEMENTS').find(
+        (edge) => edge.source === 'User' && edge.target === 'Named',
+      );
+      const fanout = getRelationships(linked, 'CALLS').filter(
+        (edge) =>
+          edge.source === 'read' &&
+          edge.target === 'name' &&
+          edge.rel.reason === 'interface-dispatch',
+      );
+
+      expect(implementsEdge?.sourceLabel).toBe('Record');
+      expect(implementsEdge?.targetLabel).toBe('Interface');
+      // TODO(#2917): implicit component accessors are not Method nodes yet.
+      // Replace this characterization with the expected User.name target.
+      expect(fanout).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 60000);
 });
 
 // ---------------------------------------------------------------------------
@@ -3205,5 +3303,72 @@ describe('Java enum-constant receiver dispatch (#2561)', () => {
     const dispatch = calls.find((c) => c.source === 'callPlain' && c.target === 'm');
     expect(dispatch).toBeDefined();
     expect(dispatch!.rel.targetId).toBe('Method:src/Plain.java:Plain.m#0');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Program boundary vs. analysis uncertainty (#2744).
+//
+// The origin classifier's only source of positive EXTERNAL evidence is
+// `LanguageProvider.isBuiltInName`. Java declared no built-in set, so no Java
+// drop could ever be judged external and every one of them hedged `impact()`
+// down to `epistemic: 'lower-bound'` — safe, but it left the language unable to
+// name its own boundary. This exercises the whole wiring end to end (provider →
+// `runScopeResolution` → pass options → classifier → drop record), which the
+// classifier unit tests deliberately do not.
+// ---------------------------------------------------------------------------
+
+describe('Java receiver-unresolved drops name the program boundary (#2744)', () => {
+  let repoDir: string;
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-java-receiver-origin-'));
+    writeFixtureRepo(repoDir, {
+      'src/Boundary.java': `public class Boundary {
+    public void platform(String raw) {
+        // Rooted at \`System\`, which the language itself names. Nothing was
+        // lost: no node in this index could have been the target.
+        System.out.println(raw);
+    }
+
+    public void unknownReceiver(OrderRepository repo) {
+        // \`OrderRepository\` is declared nowhere here and is not a platform
+        // name. Absence of evidence is not evidence of externality — this must
+        // stay hedged, or a genuinely missing in-program caller gets published
+        // as \`exact\`. Spelled as a CHAIN on purpose: a bare \`repo.findAll()\`
+        // never reaches the drop recorder at all (the pass takes a different
+        // arm and records nothing), so it would assert on an empty set.
+        repo.find().save();
+    }
+}
+`,
+    });
+    result = await runPipelineFromRepo(repoDir, () => {}, {});
+  }, 60000);
+
+  afterAll(() => {
+    if (repoDir !== undefined) fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it('marks a System.out.println(...) drop external', () => {
+    const drops = getResolutionOutcomes(result).filter(
+      (outcome) => outcome.kind === 'suppressed' && outcome.reason === 'receiver-unresolved',
+    );
+    expect(drops).toContainEqual(
+      expect.objectContaining({ name: 'println', siteKind: 'call', receiverOrigin: 'external' }),
+    );
+  });
+
+  it('does not mark a drop on an undeclared user receiver external', () => {
+    const drops = getResolutionOutcomes(result).filter(
+      (outcome) => outcome.kind === 'suppressed' && outcome.reason === 'receiver-unresolved',
+    );
+    expect(drops).toContainEqual(
+      expect.objectContaining({ name: 'save', siteKind: 'call', receiverOrigin: 'unknown' }),
+    );
+    expect(drops).not.toContainEqual(
+      expect.objectContaining({ name: 'save', receiverOrigin: 'external' }),
+    );
   });
 });

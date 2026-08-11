@@ -35,13 +35,21 @@ import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 import {
   setJavaClassAnnotationFacts,
+  setJavaSpringAopFacts,
   setJavaSpringConfigConsumerFacts,
+  setJavaSpringConditionalFacts,
   setJavaSpringDiFacts,
 } from './capture-side-channel.js';
 import { captureJavaPackageFact } from './package-facts.js';
 import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
 import { captureJavaSpringConfigConsumerFacts } from './spring-config-bindings.js';
 import { captureJavaSpringDiClassFact, type JavaSpringDiClassFact } from './spring-di.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
+import { captureJavaSpringAopFacts, type JavaSpringAopFact } from './spring-aop.js';
+import {
+  captureJavaSpringConditionalFacts,
+  type JavaSpringConditionalFact,
+} from './spring-conditionals.js';
 
 /** Declaration anchors that carry function-like arity metadata. */
 const FUNCTION_DECL_TAGS = ['@declaration.method', '@declaration.constructor'] as const;
@@ -126,6 +134,9 @@ export function emitJavaScopeCaptures(
   const rawMatches = getJavaScopeQuery().matches(tree.rootNode);
   const out: CaptureMatch[] = [];
   const classAnnotations = new Map<ScopeId, Set<string>>();
+  const springAopFacts: JavaSpringAopFact[] = [];
+  const springAopTypeNodeIds = new Set<number>();
+  const springConditionalFacts: JavaSpringConditionalFact[] = [];
   const springDiFacts: JavaSpringDiClassFact[] = [];
   const springDiClassNodeIds = new Set<number>();
 
@@ -147,9 +158,21 @@ export function emitJavaScopeCaptures(
     }
     if (Object.keys(grouped).length === 0) continue;
 
+    const springAopTypeNode = [
+      nodeIfType(nodeMap['@scope.class'], 'class_declaration'),
+      nodeIfType(nodeMap['@scope.class'], 'interface_declaration'),
+    ].find((node): node is SyntaxNode => node !== null);
+    if (springAopTypeNode !== undefined && !springAopTypeNodeIds.has(springAopTypeNode.id)) {
+      springAopTypeNodeIds.add(springAopTypeNode.id);
+      springAopFacts.push(...captureJavaSpringAopFacts(springAopTypeNode, filePath));
+    }
+
     const springDiClassNode = nodeIfType(nodeMap['@scope.class'], 'class_declaration');
     if (springDiClassNode !== null && !springDiClassNodeIds.has(springDiClassNode.id)) {
       springDiClassNodeIds.add(springDiClassNode.id);
+      springConditionalFacts.push(
+        ...captureJavaSpringConditionalFacts(springDiClassNode, filePath),
+      );
       const fact = captureJavaSpringDiClassFact(springDiClassNode, filePath);
       if (fact !== null) springDiFacts.push(fact);
     }
@@ -195,6 +218,12 @@ export function emitJavaScopeCaptures(
           continue;
         }
       }
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
       out.push(grouped);
       continue;
     }
@@ -248,6 +277,12 @@ export function emitJavaScopeCaptures(
     // Synthesize `this` / `super` receiver type-bindings on every
     // instance method-like.
     if (grouped['@scope.function'] !== undefined) {
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
       out.push(grouped);
       // `@scope.function` is captured directly on the method/constructor node.
       const fnNode = findFunctionNode(nodeMap['@scope.function']);
@@ -339,6 +374,12 @@ export function emitJavaScopeCaptures(
       }
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 
@@ -347,6 +388,8 @@ export function emitJavaScopeCaptures(
     filePath,
     captureJavaSpringConfigConsumerFacts(tree.rootNode, filePath),
   );
+  setJavaSpringAopFacts(filePath, springAopFacts);
+  setJavaSpringConditionalFacts(filePath, springConditionalFacts);
   setJavaSpringDiFacts(filePath, springDiFacts);
 
   return [
@@ -588,40 +631,27 @@ function findEnclosingTypeDeclaration(node: SyntaxNode): SyntaxNode | null {
 }
 
 /**
- * Synthesize `@reference.inherits` captures from Java class heritage so the
- * registry-primary scope-resolution path emits EXTENDS / IMPLEMENTS edges
- * (mirrors C++ `emitCppInheritanceCaptures`). Without this, Java inheritance
- * edges came only from the legacy heritage-capture leg (removed in #942), which
- * is dropped for registry-primary languages in the worker pipeline (issue #1951).
+ * Synthesize `@reference.inherits` captures from Java type heritage for the
+ * authoritative registry-primary EXTENDS / IMPLEMENTS pre-pass (mirrors C++
+ * `emitCppInheritanceCaptures`).
  *
  * Scope covers `class_declaration` (`superclass` extends + `interfaces`
- * implements clauses) AND `interface_declaration` (`extends_interfaces` →
- * interface-to-interface EXTENDS), matching the legacy Java heritage query
- * (tree-sitter-queries.ts), which has a dedicated `interface_declaration
- * (extends_interfaces (type_list …))` arm. Without the interface arm the
- * registry-primary synth silently dropped every `interface IA extends IB`
- * edge while the legacy leg emitted it — the exact =0/=N parity break #1951
- * targets. Enum/record heritage stays unemitted (no legacy arm). Generic
- * bases (`extends Box<T>`, `implements IFoo<T>`) ARE emitted here: the legacy
- * heritage query was widened to capture the inner `type_identifier` of a
- * `generic_type` (tree-sitter-queries.ts), so both paths now agree on SIMPLE
- * (unqualified) generic bases — the more-correct behavior, consistent with
- * C#/Rust (#1951). Qualified bases (`a.b.Base`, `a.b.Box<T>`, `a.b.IFoo<T>`) are
- * ALSO now at parity (#1956 tri-review U2): the synth resolves them by their
- * `scoped_type_identifier` tail, and the legacy heritage query was widened
- * with matching `scoped_type_identifier` arms (plain + generic-wrapped). The
+ * implements clauses), `record_declaration` (`interfaces` implements clauses),
+ * and `interface_declaration` (`extends_interfaces` clauses). Interface
+ * inheritance was restored for registry-primary resolution in #1951. Record
+ * graph nodes became canonical link targets in #2801 / PR #2871, so their
+ * `implements` clauses must participate for interface dispatch (#2900). Java
+ * enum interface heritage remains a separately tracked gap (#2918).
+ *
+ * Generic bases (`extends Box<T>`, `implements IFoo<T>`) and qualified bases
+ * (`a.b.Base`, `a.b.Box<T>`, `a.b.IFoo<T>`) are normalized to their simple
+ * lookup-name tails, consistent with C#/Rust and the V1 binding contract. The
  * EXTENDS-vs-IMPLEMENTS split is decided downstream from the resolved target's
  * symbol kind (`preEmitInheritanceEdges`): a superclass resolves to a class
  * (EXTENDS), an implemented interface resolves to an interface (IMPLEMENTS).
  * An `interface IA extends IB` base resolves to an Interface too, so it is
- * emitted as IMPLEMENTS — matching the legacy `interface_declaration` arm,
- * which tagged the bases as implements (`kind: 'implements'`) and likewise
- * resolves them as interfaces. The synth therefore does not need to know the
- * declaration's own kind; it only emits inherits sites and lets the resolved
- * target decide the edge type.
- * Base names are normalized to their bare simple identifier (`Box<T>` → `Box`,
- * `java.io.Serializable` → `Serializable`) to match the V1 simple-name
- * `findClassBindingInScope` contract.
+ * emitted as IMPLEMENTS. The synth only emits inheritance sites and lets the
+ * resolved target decide the edge type.
  */
 function synthesizeJavaInheritanceReferences(root: SyntaxNode): CaptureMatch[] {
   const out: CaptureMatch[] = [];
@@ -633,6 +663,10 @@ function synthesizeJavaInheritanceReferences(root: SyntaxNode): CaptureMatch[] {
       if (superclass !== null) {
         for (const base of superclass.namedChildren) emitJavaInheritanceBase(out, base);
       }
+    }
+    if (node.type === 'class_declaration' || node.type === 'record_declaration') {
+      // Records cannot declare a superclass; they share only the class
+      // `interfaces` arm.
       const interfaces = node.childForFieldName('interfaces');
       if (interfaces !== null) {
         for (const typeList of interfaces.namedChildren) {

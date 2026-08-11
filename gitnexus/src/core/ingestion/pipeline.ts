@@ -33,6 +33,9 @@ import {
   crossFilePhase,
   scopeResolutionPhase,
   springConfigPhase,
+  springAutoConfigurationPhase,
+  springAopPhase,
+  springAopInheritancePhase,
   pruneLocalSymbolsPhase,
   taintSummariesPhase,
   callSummariesPhase,
@@ -55,6 +58,14 @@ export interface PipelineOptions {
    * to retain those nodes under `skipGraphPhases`.
    */
   skipGraphPhases?: boolean;
+  /** Per-advice Spring AOP candidate inspection cap. `0` disables this cap. */
+  springAopMaxCandidateInspectionsPerAdvice?: number;
+  /** Aggregate Spring AOP candidate inspection cap for one analysis. `0` disables this cap. */
+  springAopMaxCandidateInspections?: number;
+  /** Per-advice Spring AOP `ADVISED_BY` edge cap. `0` disables this cap. */
+  springAopMaxAdvisedEdgesPerAdvice?: number;
+  /** Aggregate Spring AOP advice-edge cap for one analysis. `0` disables this cap. */
+  springAopMaxAdvisedEdges?: number;
   /**
    * Build the control-flow-graph / PDG substrate (#2081 M1, opt-in via `--pdg`).
    * Off by default: workers skip all CFG work and emit no `cfgSideChannel`, and
@@ -261,8 +272,8 @@ export interface PipelineOptions {
  * Phase dependency graph:
  *
  *   scan → structure → [springConfig, markdown, cobol] → parse → [routes, tools, orm]
- *     → crossFile → scopeResolution → pruneLocalSymbols
- *     → mro → di → communities → processes
+ *     → crossFile → scopeResolution → [springAutoConfiguration, springAop] → pruneLocalSymbols
+ *     → mro → springAopInheritance → di → communities → processes
  *
  * To add a new phase: create a file in pipeline-phases/, export the phase
  * object, and `.register()` it at the appropriate position below. Opt-in
@@ -288,6 +299,8 @@ export function buildPhaseList(options?: PipelineOptions): PipelinePhase[] {
       .register(ormPhase)
       .register(crossFilePhase)
       .register(scopeResolutionPhase)
+      .register(springAutoConfigurationPhase)
+      .register(springAopPhase)
       .register(pruneLocalSymbolsPhase)
       // M4 (#2084): interprocedural taint fixpoint — the first real opt-in
       // pdg-gated phase. Off ⇒ absent ⇒ byte-identical graph. No always-on
@@ -295,6 +308,7 @@ export function buildPhaseList(options?: PipelineOptions): PipelinePhase[] {
       .register(taintSummariesPhase, { enabledWhen: (o) => o.pdg === true })
       .register(callSummariesPhase, { enabledWhen: (o) => o.pdg === true })
       .register(mroPhase, { enabledWhen: (o) => !o.skipGraphPhases })
+      .register(springAopInheritancePhase, { enabledWhen: (o) => !o.skipGraphPhases })
       .register(diPhase, { enabledWhen: (o) => !o.skipGraphPhases })
       .register(communitiesPhase, { enabledWhen: (o) => !o.skipGraphPhases })
       .register(processesPhase, { enabledWhen: (o) => !o.skipGraphPhases })
@@ -367,6 +381,7 @@ export const runPipelineFromRepo = async (
   const resolutionOutcomes = scopeResolutionOutput.resolutionOutcomes;
   // Streamed PDG-emit manifest (#2202): present only when streaming was on.
   const pdgEmitManifest = scopeResolutionOutput.pdgEmitManifest;
+  const propertyInference = scopeResolutionOutput.propertyInference;
 
   // Presence check, not `!skipGraphPhases`: phases can now be filtered out by
   // any `enabledWhen` predicate (streamGraphEmit disables communities/processes
@@ -408,5 +423,6 @@ export const runPipelineFromRepo = async (
     resolutionOutcomes,
     usedWorkerPool,
     pdgEmitManifest,
+    propertyInference,
   };
 };
